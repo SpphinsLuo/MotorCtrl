@@ -1,0 +1,32 @@
+<launch>
+    <!-- 声明参数（可选） -->
+    <!-- <arg name="motor_can_id" default="1" description="电机CAN ID"/>
+    <arg name="data_save_path" default="$(find my_robot_control)/data" description="数据保存路径"/> -->
+    
+    <!-- 第一个节点 -->
+    <node 
+      pkg="motor_ctrl" 
+      exec="motorevo_PV_test" 
+      name="motorevo_PV_test" 
+      output="screen">
+      <!-- 节点参数 -->
+      <!-- <param name="can_id" value="$(arg motor_can_id)"/>
+      <param name="control_cycle_ms" value="2"/>
+      <param name="timeout_us" value="500"/> -->
+      <!-- 话题重映射 -->
+      <!-- <remap from="/knee/state" to="/robot/knee/state"/> -->
+    </node>
+  
+    <!-- 第二个节点 -->
+    <node 
+      pkg="motor_ctrl" 
+      exec="single_motor_ctrl" 
+      name="single_motor_ctrl" 
+      output="screen">
+      <!-- 节点参数 -->
+      <!-- <param name="save_path" value="$(arg data_save_path)"/>
+      <param name="record_frequency" value="500"/> -->
+      <!-- 话题重映射 -->
+      <!-- <remap from="/input/motor_state" to="/knee_motor_controller_node/motor_state"/> -->
+    </node>
+  </launch>

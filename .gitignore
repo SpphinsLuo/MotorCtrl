@@ -1,0 +1,58 @@
+# Colcon / ROS 2 overlay artifacts
+build/
+install/
+log/
+.colcon/
+COLCON_IGNORE
+AMENT_IGNORE
+.catkin_workspace
+.catkin/
+
+# CMake / compiler artifacts (keep sources; ignore generated)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Logs, bags, dumps
+*.log
+*.bag
+core
+core.*
+*.core
+
+# Editor / OS junk
+*~
+*.swp
+*.swo
+*.orig
+.DS_Store
+*.code-workspace
+
+# Caches
+.cache/
+ccache/
+.ccache/
+
+# Local IDE / agent metadata
+.vscode/
+.idea/
+.cursor/
+
+# Preserve local nested-clone metadata without treating packages as submodules
+.nested-git/

@@ -1,0 +1,17 @@
+# biped_hw — 99-usb2can-biped.rules
+# 草稿：把左右 USB-CAN 绑到 /dev/usb2can_left|right。须填真实 serial 后再启用。
+# Draft udev rules for the two USB-CAN adapters (left / right).
+# Do not enable this as-is: ATTRS{serial} must be filled from the real devices.
+#
+# Inspect:
+#   udevadm info -a -n /dev/ttyACM0 | grep -E 'idVendor|idProduct|{serial}'
+#   udevadm info -a -n /dev/ttyACM1 | grep -E 'idVendor|idProduct|{serial}'
+#
+# Install:
+#   sudo cp 99-usb2can-biped.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# Then point config/motor_map.yaml at /dev/usb2can_left and /dev/usb2can_right.
+
+# SUBSYSTEM=="tty", ATTRS{idVendor}=="XXXX", ATTRS{idProduct}=="XXXX", ATTRS{serial}=="LEFT_SERIAL_HERE",  SYMLINK+="usb2can_left",  GROUP="dialout", MODE="0660"
+# SUBSYSTEM=="tty", ATTRS{idVendor}=="XXXX", ATTRS{idProduct}=="XXXX", ATTRS{serial}=="RIGHT_SERIAL_HERE", SYMLINK+="usb2can_right", GROUP="dialout", MODE="0660"

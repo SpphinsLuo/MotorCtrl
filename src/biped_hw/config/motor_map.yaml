@@ -1,0 +1,23 @@
+# biped_hw — motor_map.yaml
+# 运行时覆盖：左右 USB-CAN 串口路径（以及日后 zero/dir）。CAN ID 仍以 motor_map.hpp 为准。
+# Runtime overlays only. CAN IDs, master ID (2 / 0x02), models, and joint
+# roles are the compile-time table in include/biped_hw/motor_map.hpp.
+#
+# After filling udev/99-usb2can-biped.rules, switch ports to the aliases:
+#   left:  /dev/usb2can_left
+#   right: /dev/usb2can_right
+#
+# MBS USB-RS485 encoder port is in mbs_encoder.yaml (by-id, not ttyUSB*).
+# N100 IMU is the CP210x; do not point the encoder at that adapter.
+
+buses:
+  left:
+    port: /dev/ttyACM0
+    # alias: /dev/usb2can_left
+  right:
+    port: /dev/ttyACM1
+    # alias: /dev/usb2can_right
+
+# Optional later (P1+). Do not put motor IDs here.
+# zeros: {}
+# dirs: {}

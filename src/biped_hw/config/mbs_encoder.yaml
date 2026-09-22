@@ -1,0 +1,45 @@
+# biped_hw — mbs_encoder.yaml
+# MBS 磁编码器 USB-RS485（Prolific pl2303）。不要用 /dev/ttyUSB*：
+# Wheeltec N100 IMU 是 Silicon Labs CP210x，两个设备都会变成 ttyUSB0/1，插拔顺序会换。
+# Override: mbs_encoder_recv --port /dev/serial/by-id/...
+#
+# 8 joint BUS-D addresses are a software map (用户给的十进制地址).
+# Do not program new addresses into the sensors. Factory may still be 0x1F:
+# missing/timeout → valid=false, do not fake angles.
+# Hip yaw / ankle roll have no encoder (those motors exist on the 12-map).
+# zero_rad / sign are uncalibrated defaults; later calibration fills them.
+port: /dev/serial/by-id/usb-Prolific_Technology_Inc._USB-Serial_Controller_BGA_b114J19-if00-port0
+
+encoders:
+  - name: left_hip_roll
+    addr: 4
+    zero_rad: 0.0
+    sign: 1
+  - name: left_hip_pitch
+    addr: 5
+    zero_rad: 0.0
+    sign: 1
+  - name: left_knee_pitch
+    addr: 6
+    zero_rad: 0.0
+    sign: 1
+  - name: left_ankle_pitch
+    addr: 7
+    zero_rad: 0.0
+    sign: 1
+  - name: right_hip_roll
+    addr: 10
+    zero_rad: 0.0
+    sign: 1
+  - name: right_hip_pitch
+    addr: 11
+    zero_rad: 0.0
+    sign: 1
+  - name: right_knee_pitch
+    addr: 12
+    zero_rad: 0.0
+    sign: 1
+  - name: right_ankle_pitch
+    addr: 13
+    zero_rad: 0.0
+    sign: 1
