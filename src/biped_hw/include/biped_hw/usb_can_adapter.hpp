@@ -75,6 +75,10 @@ public:
   bool open();
   void close();
   bool is_open() const { return serial_.is_open(); }
+  int native_fd() const { return serial_.native_fd(); }
+  int recv_timeout_ms() const { return serial_.timeout_ms(); }
+  void set_recv_timeout(int timeout_ms) { serial_.set_timeout(timeout_ms); }
+  std::size_t queued_bytes() const { return serial_.queued_bytes(); }
 
   const std::string &port() const { return serial_.port(); }
   const std::string &last_error() const;

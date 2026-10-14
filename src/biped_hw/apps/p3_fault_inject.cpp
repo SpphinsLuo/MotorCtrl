@@ -1,6 +1,6 @@
 // biped_hw — p3_fault_inject.cpp
 // P3 故障注入：左总线同步循环中 --ignore-id 模拟丢帧（不发、不等待）。
-// 只记录其它 ID 是否仍更新、循环是否被拖死。P5 才做 disable-all。
+// 只记录其它 ID 是否仍更新、循环是否被拖死。退出/SIGINT 走 P5 disable-all。
 #include "biped_hw/p3_runtime.hpp"
 
 #include <cstdio>

@@ -1,5 +1,4 @@
 # wheeltec_n100_imu — imu.launch.py
-# N100 是 Silicon Labs CP210x（ttyUSB*），不是 ACM。ACM0/ACM1 预留给左右 USB2CAN。
 # 用 by-id，避免和 MBS USB-RS485（Prolific）抢 ttyUSB0。
 # 覆盖：ros2 launch wheeltec_n100_imu imu.launch.py port:=/dev/serial/by-id/...
 from launch import LaunchDescription

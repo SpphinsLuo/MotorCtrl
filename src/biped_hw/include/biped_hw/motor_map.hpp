@@ -40,7 +40,7 @@ inline constexpr std::array<MotorMapEntry, kMotorCount> kMotorMap{{
     {BusId::Left, kMasterId, 5, JointId::LHipParallelInner, MotorType::DM10010,
      ""},
     {BusId::Left, kMasterId, 6, JointId::LKneePitch, MotorType::DM10422,
-     "cable 1:1; limits UNVERIFIED, read RID 21/22/23 in P1"},
+     "cable 1:1; table {12.5,20,400}, RID 21/22/23 overrides"},
     {BusId::Left, kMasterId, 7, JointId::LAnklePitch, MotorType::DM10010L,
      "cable 1:1"},
     {BusId::Left, kMasterId, 8, JointId::LAnkleRoll, MotorType::HA60,
@@ -51,7 +51,7 @@ inline constexpr std::array<MotorMapEntry, kMotorCount> kMotorMap{{
     {BusId::Right, kMasterId, 11, JointId::RHipParallelInner, MotorType::DM10010,
      ""},
     {BusId::Right, kMasterId, 12, JointId::RKneePitch, MotorType::DM10422,
-     "UNVERIFIED limits"},
+     "table {12.5,20,400}"},
     {BusId::Right, kMasterId, 13, JointId::RAnklePitch, MotorType::DM10010L, ""},
     {BusId::Right, kMasterId, 14, JointId::RAnkleRoll, MotorType::HA60,
      "Motorevo HA60-100, servo default later"},
@@ -120,6 +120,12 @@ inline constexpr const MotorMapEntry *find_by_can_id(uint8_t can_id)
     }
   }
   return nullptr;
+}
+
+inline constexpr bool mapped_damiao_mit_master2(uint8_t can_id)
+{
+  const auto *e = find_by_can_id(can_id);
+  return e != nullptr && e->master_id == kMasterId && is_damiao_mit(e->model);
 }
 
 inline constexpr const MotorMapEntry *find_by_joint(JointId joint)

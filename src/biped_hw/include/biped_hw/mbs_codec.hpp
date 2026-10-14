@@ -123,7 +123,7 @@ enum class MbsCmd : uint8_t
 
 struct MbsLayout
 {
-  uint8_t single_bits = 17;  // 16 or 17
+  uint8_t single_bits = 17;  
   bool multi = false;
   MbsCmd cmd = MbsCmd::GetPosStatus;
 };
@@ -889,6 +889,16 @@ inline int mbs_bus_codec_self_test()
     {
       return 38;
     }
+  }
+
+  // SetZero op=01, joint addrs 6 and 12: low7 already odd → no b7.
+  if (mbs_bus_request(MbsBusOp::SetZero, 6) != 0x26)
+  {
+    return 39;
+  }
+  if (mbs_bus_request(MbsBusOp::SetZero, 12) != 0x2C)
+  {
+    return 40;
   }
   return 0;
 }

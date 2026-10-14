@@ -3,13 +3,17 @@
 // --enable-knees：只 0xFC CAN 6 与 12，MIT 在探测到的 q0 保持，退出 0xFD。
 // 可选 MBS 轮询，可选订阅 /imu（独立 executor 线程；不打开 N100 串口）。
 // 缺传感器 valid=false，不填假数。
+#include "biped_hw/cli.hpp"
 #include "biped_hw/dm_codec.hpp"
+#include "biped_hw/dm_mit_host.hpp"
 #include "biped_hw/frame_demux.hpp"
 #include "biped_hw/mbs_codec.hpp"
+#include "biped_hw/mbs_host.hpp"
 #include "biped_hw/mbs_map.hpp"
 #include "biped_hw/motor_map.hpp"
 #include "biped_hw/motorevo_codec.hpp"
 #include "biped_hw/robot_state.hpp"
+#include "biped_hw/safety.hpp"
 #include "biped_hw/serial_port.hpp"
 #include "biped_hw/usb_can_adapter.hpp"
 
@@ -38,63 +42,33 @@ volatile std::sig_atomic_t g_run = 1;
 
 constexpr uint8_t kKneeLeftId = 6;
 constexpr uint8_t kKneeRightId = 12;
-constexpr int kDisableGapUs = 10000;
 constexpr int kEnableSettleUs = 100000;
 constexpr int kProbeTicks = 20;
 constexpr float kHoldKp = 20.f;
 constexpr float kHoldKd = 1.f;
 constexpr float kAbortTauNm = 15.f;
 
-biped_hw::UsbCanAdapter *g_disable_ad[2] = {};
-uint8_t g_disable_ids[2] = {};
-std::size_t g_disable_n = 0;
+biped_hw::UsbCanAdapter *g_left = nullptr;
+biped_hw::UsbCanAdapter *g_right = nullptr;
 
-void send_disable(biped_hw::UsbCanAdapter *a, uint8_t id)
+void disable_all_now(bool print)
 {
-  if (a == nullptr || !a->is_open())
-  {
-    return;
-  }
-  uint8_t buf[8] = {};
-  biped_hw::pack_disable(buf);
-  a->sendCan(id, buf, 8);
-  usleep(kDisableGapUs);
-  a->sendCan(id, buf, 8);
-}
-
-void disable_knees_now(bool print)
-{
-  for (std::size_t i = 0; i < g_disable_n; ++i)
-  {
-    send_disable(g_disable_ad[i], g_disable_ids[i]);
-    if (print)
-    {
-      std::printf("disable id=%u sent (0xFD)\n",
-                  static_cast<unsigned>(g_disable_ids[i]));
-    }
-  }
-  g_disable_n = 0;
+  const auto r = biped_hw::safety_estop_latched() ? biped_hw::SafetyReason::Estop
+                                                  : biped_hw::safety_last_reason();
+  biped_hw::safety_disable_all(
+      g_left, g_right, nullptr, 0,
+      r == biped_hw::SafetyReason::None ? biped_hw::SafetyReason::Estop : r, print);
 }
 
 void atexit_disable()
 {
-  disable_knees_now(false);
-}
-
-void arm_disable(biped_hw::UsbCanAdapter *a, uint8_t id)
-{
-  if (a == nullptr || g_disable_n >= 2)
-  {
-    return;
-  }
-  g_disable_ad[g_disable_n] = a;
-  g_disable_ids[g_disable_n] = id;
-  ++g_disable_n;
+  biped_hw::safety_atexit_disable();
 }
 
 void on_sigint(int)
 {
   g_run = 0;
+  biped_hw::safety_estop_trip();
 }
 
 struct Options
@@ -128,8 +102,8 @@ void usage()
       "     --enable-knees: 0xFC only decimal CAN 6 (left) and 12 (right).\n"
       "     Probe q0 with kp=0, then MIT hold at that q (kp=20 kd=1, dq=0).\n"
       "     Does not spin 5 rad/s. Does not enable IDs 3–5,7–11,13–14.\n"
-      "     abort-tau=15 Nm (not a flag; do not raise). 0xFD both at exit.\n"
-      "     No --force-limits. Requires both USB-CAN ports.\n"
+      "     abort-tau=15 Nm (not a flag; do not raise). Fault: P5 disable-all 0xFD\n"
+      "     on map 3-14 (both buses). No --force-limits. Requires both USB-CAN ports.\n"
       "MBS: --mbs polls 8 joint addrs from config/mbs_encoder.yaml\n"
       "     (decimal 4,5,6,7,10,11,12,13) sequential on one BUS-D.\n"
       "     --mbs-addr N still single-polls that address (0..31 decimal or 0x1F).\n"
@@ -142,25 +116,12 @@ void usage()
       "--can-id is not a flag here; map CAN IDs are decimal 3–14.\n");
 }
 
-unsigned parse_u(const char *s, bool &ok)
-{
-  char *end = nullptr;
-  const unsigned long v = std::strtoul(s, &end, 0);
-  ok = end != s && end != nullptr && *end == '\0';
-  return static_cast<unsigned>(v);
-}
-
 bool parse_args(int argc, char **argv, Options &opt, std::string &err)
 {
   for (int i = 1; i < argc; ++i)
   {
     auto need = [&](const char *flag) -> const char * {
-      if (i + 1 >= argc)
-      {
-        err = std::string(flag) + " needs a value";
-        return nullptr;
-      }
-      return argv[++i];
+      return biped_hw::need_arg(i, argc, argv, flag, err);
     };
     if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0)
     {
@@ -210,7 +171,7 @@ bool parse_args(int argc, char **argv, Options &opt, std::string &err)
         return false;
       }
       bool ok = false;
-      const unsigned n = parse_u(v, ok);
+      const unsigned n = biped_hw::parse_u(v, ok);
       if (!ok || n == 0)
       {
         err = "--period-ms must be > 0";
@@ -254,7 +215,7 @@ bool parse_args(int argc, char **argv, Options &opt, std::string &err)
         return false;
       }
       bool ok = false;
-      const unsigned n = parse_u(v, ok);
+      const unsigned n = biped_hw::parse_u(v, ok);
       if (!ok || n > biped_hw::kMbsBusAddrMask)
       {
         err = "--mbs-addr is 0..31 decimal (or 0x1F); not a motor --can-id";
@@ -391,73 +352,6 @@ void listen_bus(biped_hw::UsbCanAdapter &ad, biped_hw::FrameDemux &demux,
   }
 }
 
-bool wait_register(biped_hw::UsbCanAdapter &adapter, biped_hw::FrameDemux &demux,
-                   uint8_t esc_id, uint8_t rid, biped_hw::DmRegisterReply &reply,
-                   int timeout_ms)
-{
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-  while (std::chrono::steady_clock::now() < deadline)
-  {
-    biped_hw::CanRxFrame rx;
-    if (adapter.pollCan(rx))
-    {
-      demux.push(rx);
-    }
-    if (demux.take_register(esc_id, rid, reply))
-    {
-      return true;
-    }
-  }
-  return false;
-}
-
-bool read_rid_retries(biped_hw::UsbCanAdapter &adapter, biped_hw::FrameDemux &demux,
-                      uint8_t esc_id, uint8_t rid, float &value)
-{
-  for (int i = 0; i < 3; ++i)
-  {
-    demux.clear();
-    uint8_t buf[8] = {};
-    biped_hw::pack_register_read(buf, esc_id, rid);
-    if (!adapter.sendCan(biped_hw::kDmRegCanId, buf, 8))
-    {
-      continue;
-    }
-    biped_hw::DmRegisterReply reply{};
-    if (wait_register(adapter, demux, esc_id, rid, reply, 200))
-    {
-      value = reply.f;
-      return true;
-    }
-  }
-  return false;
-}
-
-bool write_rid_u32_retries(biped_hw::UsbCanAdapter &adapter, biped_hw::FrameDemux &demux,
-                           uint8_t esc_id, uint8_t rid, uint32_t value)
-{
-  for (int i = 0; i < 3; ++i)
-  {
-    demux.clear();
-    uint8_t buf[8] = {};
-    biped_hw::pack_register_write_u32(buf, esc_id, rid, value);
-    if (!adapter.sendCan(biped_hw::kDmRegCanId, buf, 8))
-    {
-      continue;
-    }
-    biped_hw::DmRegisterReply reply{};
-    if (wait_register(adapter, demux, esc_id, rid, reply, 200))
-    {
-      if (reply.u == value || static_cast<uint32_t>(reply.f + 0.5f) == value)
-      {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
 struct KneeHold
 {
   uint8_t can_id = 0;
@@ -469,63 +363,34 @@ struct KneeHold
 
 bool enable_knee(KneeHold &k, biped_hw::UsbCanAdapter &ad, biped_hw::FrameDemux &dm)
 {
-  float pmax = 0.f, vmax = 0.f, tmax = 0.f;
-  const bool pok = read_rid_retries(ad, dm, k.can_id,
-                                    static_cast<uint8_t>(biped_hw::DmRid::Pmax), pmax);
-  const bool vok = read_rid_retries(ad, dm, k.can_id,
-                                    static_cast<uint8_t>(biped_hw::DmRid::Vmax), vmax);
-  const bool tok = read_rid_retries(ad, dm, k.can_id,
-                                    static_cast<uint8_t>(biped_hw::DmRid::Tmax), tmax);
+  biped_hw::DmMitEnableStatus st;
+  const biped_hw::DmMitEnableErr en =
+      biped_hw::dm_enable_mit(ad, dm, k.can_id, true, st);
   std::printf("id=%u RID 21/22/23 PMAX=%s%.4f VMAX=%s%.4f TMAX=%s%.4f\n",
-              static_cast<unsigned>(k.can_id), pok ? "" : "FAIL ",
-              static_cast<double>(pmax), vok ? "" : "FAIL ", static_cast<double>(vmax),
-              tok ? "" : "FAIL ", static_cast<double>(tmax));
-  if (!(pok && vok && tok && pmax > 0.1f && vmax > 0.1f && tmax > 0.1f))
+              static_cast<unsigned>(k.can_id), st.pmax_ok ? "" : "FAIL ",
+              static_cast<double>(st.pmax), st.vmax_ok ? "" : "FAIL ",
+              static_cast<double>(st.vmax), st.tmax_ok ? "" : "FAIL ",
+              static_cast<double>(st.tmax));
+  if (en == biped_hw::DmMitEnableErr::Rid)
   {
     std::fprintf(stderr,
                  "REFUSE enable id=%u: Damiao MIT limits UNVERIFIED (RID 21/22/23 failed)\n",
                  static_cast<unsigned>(k.can_id));
     return false;
   }
-  k.lim = biped_hw::LimitParam{pmax, vmax, tmax};
-
-  uint8_t dis[8] = {};
-  biped_hw::pack_disable(dis);
-  ad.sendCan(k.can_id, dis, 8);
-  usleep(kDisableGapUs);
-  ad.sendCan(k.can_id, dis, 8);
-  usleep(kDisableGapUs);
-  ad.drain();
-  dm.clear();
-
-  float mode_f = 0.f;
-  const bool before_ok = read_rid_retries(
-      ad, dm, k.can_id, static_cast<uint8_t>(biped_hw::DmRid::CtrlMode), mode_f);
-  const uint32_t before = static_cast<uint32_t>(mode_f + 0.5f);
-  const bool wrote =
-      write_rid_u32_retries(ad, dm, k.can_id,
-                            static_cast<uint8_t>(biped_hw::DmRid::CtrlMode),
-                            biped_hw::kDmMitMode);
-  usleep(20000);
-  mode_f = 0.f;
-  const bool after_ok = read_rid_retries(
-      ad, dm, k.can_id, static_cast<uint8_t>(biped_hw::DmRid::CtrlMode), mode_f);
-  const uint32_t after = static_cast<uint32_t>(mode_f + 0.5f);
+  k.lim = st.lim;
   std::printf("id=%u CTRL_MODE before=%s%u write=%s after=%s%u (%s)\n",
-              static_cast<unsigned>(k.can_id), before_ok ? "" : "FAIL ",
-              static_cast<unsigned>(before), wrote ? "ack" : "NO-ACK",
-              after_ok ? "" : "FAIL ", static_cast<unsigned>(after),
-              biped_hw::dm_ctrl_mode_name(after));
-  if (!after_ok || after != biped_hw::kDmMitMode)
+              static_cast<unsigned>(k.can_id), st.ctrl_before_ok ? "" : "FAIL ",
+              static_cast<unsigned>(st.ctrl_before), st.wrote_ack ? "ack" : "NO-ACK",
+              st.ctrl_after_ok ? "" : "FAIL ", static_cast<unsigned>(st.ctrl_after),
+              biped_hw::dm_ctrl_mode_name(st.ctrl_after));
+  if (en == biped_hw::DmMitEnableErr::CtrlMode)
   {
     std::fprintf(stderr, "REFUSE enable id=%u: need CTRL_MODE=MIT(1)\n",
                  static_cast<unsigned>(k.can_id));
     return false;
   }
-
-  uint8_t en[8] = {};
-  biped_hw::pack_enable(en);
-  if (!ad.sendCan(k.can_id, en, 8))
+  if (en != biped_hw::DmMitEnableErr::Ok)
   {
     std::fprintf(stderr, "enable send failed id=%u\n", static_cast<unsigned>(k.can_id));
     return false;
@@ -533,49 +398,6 @@ bool enable_knee(KneeHold &k, biped_hw::UsbCanAdapter &ad, biped_hw::FrameDemux 
   std::printf("enable id=%u sent (0xFC)\n", static_cast<unsigned>(k.can_id));
   k.enabled = true;
   return true;
-}
-
-bool probe_q0(KneeHold &k, biped_hw::UsbCanAdapter &ad, biped_hw::FrameDemux &dm)
-{
-  uint8_t mit[8] = {};
-  biped_hw::pack_mit(mit, 0.f, 0.f, 0.f, 0.f, 0.f, k.lim);
-  for (int i = 0; i < kProbeTicks; ++i)
-  {
-    dm.clear();
-    if (!ad.sendCan(k.can_id, mit, 8))
-    {
-      continue;
-    }
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(40);
-    while (std::chrono::steady_clock::now() < deadline)
-    {
-      biped_hw::CanRxFrame rx;
-      if (ad.pollCan(rx))
-      {
-        dm.push(rx);
-      }
-      biped_hw::DmFeedback fb{};
-      if (dm.take_mit(k.can_id, k.lim, fb))
-      {
-        k.q0 = fb.q;
-        k.have_q = true;
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-void send_knee_hold(KneeHold &k, biped_hw::UsbCanAdapter &ad)
-{
-  if (!k.enabled || !k.have_q || !ad.is_open())
-  {
-    return;
-  }
-  uint8_t mit[8] = {};
-  biped_hw::pack_mit(mit, kHoldKp, kHoldKd, k.q0, 0.f, 0.f, k.lim);
-  ad.sendCan(k.can_id, mit, 8);
 }
 
 void print_knee_motor(const biped_hw::RobotState &st, uint8_t can_id)
@@ -626,67 +448,7 @@ void print_summary(const biped_hw::RobotState &st, bool abort_tau)
       st.imu.recv_age_ms, static_cast<long long>(st.imu.t_recv_ns));
 }
 
-bool poll_mbs_once(biped_hw::SerialPort &serial, uint8_t addr, int timeout_ms,
-                   bool rts_de, biped_hw::MbsSample &out)
-{
-  biped_hw::MbsBusLayout lay;
-  lay.single_bits = 17;
-  lay.multi_bits = 0;
-  lay.op = biped_hw::MbsBusOp::GetInfo;
-  lay.addr = addr;
-  const uint8_t tx = biped_hw::mbs_bus_request(lay);
-  const std::size_t reply_n = biped_hw::mbs_bus_reply_size(lay);
-  serial.flush_input();
-  if (rts_de)
-  {
-    serial.set_rts(true);
-  }
-  if (serial.send(&tx, 1) != 1)
-  {
-    if (rts_de)
-    {
-      serial.set_rts(false);
-    }
-    return false;
-  }
-  serial.drain_output();
-  if (rts_de)
-  {
-    serial.set_rts(false);
-  }
-  uint8_t raw[16];
-  const ssize_t n = serial.recv_n(raw, reply_n + 1, timeout_ms);
-  if (n <= 0)
-  {
-    return false;
-  }
-  uint8_t view[16];
-  std::size_t view_n = static_cast<std::size_t>(n) < sizeof(view)
-                           ? static_cast<std::size_t>(n)
-                           : sizeof(view);
-  std::memcpy(view, raw, view_n);
-  view_n = biped_hw::mbs_bus_strip_leading_echo(view, view_n, tx, reply_n);
-  return view_n >= reply_n && biped_hw::mbs_bus_unpack(view, view_n, lay, out);
-}
-
-std::string tty_driver_name(const std::string &port)
-{
-  char resolved[PATH_MAX];
-  const char *p = ::realpath(port.c_str(), resolved) ? resolved : port.c_str();
-  const char *slash = std::strrchr(p, '/');
-  const std::string name = slash == nullptr ? std::string(p) : std::string(slash + 1);
-  const std::string path = "/sys/class/tty/" + name + "/device/driver";
-  char buf[256];
-  const ssize_t n = ::readlink(path.c_str(), buf, sizeof(buf) - 1);
-  if (n <= 0)
-  {
-    return {};
-  }
-  buf[n] = '\0';
-  std::string link(buf);
-  const auto last = link.find_last_of('/');
-  return last == std::string::npos ? link : link.substr(last + 1);
-}
+int run(Options opt, int argc, char **argv);
 
 }  // namespace
 
@@ -744,7 +506,14 @@ int main(int argc, char **argv)
         "motors not enabled; missing bus → valid=false)\n");
     return 0;
   }
+  return run(opt, argc, argv);
+}
 
+namespace
+{
+
+int run(Options opt, int argc, char **argv)
+{
   std::printf(
       "p4_state_dump duration=%.1f period-ms=%d motors=%s mbs=%s imu=%s "
       "(abort-tau=15, no --force-limits)\n",
@@ -798,7 +567,6 @@ int main(int argc, char **argv)
     }
   }
 
-  g_disable_n = 0;
   std::atexit(atexit_disable);
 
   KneeHold knee_l{};
@@ -813,23 +581,32 @@ int main(int argc, char **argv)
       std::fprintf(stderr, "--enable-knees needs both USB-CAN ports open\n");
       return 2;
     }
+    g_left = &left_ad;
+    g_right = &right_ad;
+    biped_hw::safety_bind_buses(&left_ad, &right_ad);
     if (!enable_knee(knee_l, left_ad, left_demux))
     {
+      biped_hw::safety_set_reason(biped_hw::SafetyReason::RidFail);
+      disable_all_now(true);
       return 1;
     }
-    arm_disable(&left_ad, kKneeLeftId);
+    biped_hw::safety_arm();
     usleep(kEnableSettleUs);
     if (!enable_knee(knee_r, right_ad, right_demux))
     {
-      disable_knees_now(true);
+      biped_hw::safety_set_reason(biped_hw::SafetyReason::RidFail);
+      disable_all_now(true);
       return 1;
     }
-    arm_disable(&right_ad, kKneeRightId);
     usleep(kEnableSettleUs);
     lim_override[kKneeLeftId] = knee_l.lim;
     lim_override[kKneeRightId] = knee_r.lim;
-    const bool q_l = probe_q0(knee_l, left_ad, left_demux);
-    const bool q_r = probe_q0(knee_r, right_ad, right_demux);
+    const bool q_l = biped_hw::dm_probe_q0(left_ad, left_demux, knee_l.can_id, knee_l.lim,
+                                          knee_l.q0, kProbeTicks, 40);
+    knee_l.have_q = q_l;
+    const bool q_r = biped_hw::dm_probe_q0(right_ad, right_demux, knee_r.can_id, knee_r.lim,
+                                          knee_r.q0, kProbeTicks, 40);
+    knee_r.have_q = q_r;
     std::printf("q0 id%u=%s%.4f  id%u=%s%.4f  (kp=0 after 0xFC; hold kp=%.0f kd=%.0f)\n",
                 static_cast<unsigned>(kKneeLeftId), q_l ? "" : "FAIL ",
                 static_cast<double>(knee_l.q0), static_cast<unsigned>(kKneeRightId),
@@ -837,8 +614,8 @@ int main(int argc, char **argv)
                 static_cast<double>(kHoldKp), static_cast<double>(kHoldKd));
     if (!q_l || !q_r)
     {
-      std::fprintf(stderr, "no q0 after enable; aborting (0xFD both)\n");
-      disable_knees_now(true);
+      std::fprintf(stderr, "no q0 after enable; aborting (P5 disable-all 0xFD)\n");
+      disable_all_now(true);
       return 1;
     }
   }
@@ -856,7 +633,7 @@ int main(int argc, char **argv)
     else
     {
       mbs_open = mbs_serial.open();
-      const std::string drv = tty_driver_name(opt.mbs_port);
+      const std::string drv = biped_hw::tty_driver_name(opt.mbs_port);
       if (drv != "pl2303")
       {
         opt.mbs_rts_de = false;
@@ -927,8 +704,16 @@ int main(int argc, char **argv)
 
     if (opt.enable_knees)
     {
-      send_knee_hold(knee_l, left_ad);
-      send_knee_hold(knee_r, right_ad);
+      if (knee_l.enabled && knee_l.have_q)
+      {
+        biped_hw::dm_send_mit_hold(left_ad, knee_l.can_id, kHoldKp, kHoldKd, knee_l.q0,
+                                   knee_l.lim);
+      }
+      if (knee_r.enabled && knee_r.have_q)
+      {
+        biped_hw::dm_send_mit_hold(right_ad, knee_r.can_id, kHoldKp, kHoldKd, knee_r.q0,
+                                   knee_r.lim);
+      }
     }
 
     listen_bus(left_ad, left_demux, st, biped_hw::BusId::Left, t_rx, lim_override);
@@ -945,9 +730,10 @@ int main(int argc, char **argv)
           (i12 >= 0 && st.motors[static_cast<std::size_t>(i12)].valid &&
            std::fabs(tau12) > kAbortTauNm))
       {
-        std::fprintf(stderr, "ABORT |tau|>%.1f (id6=%.3f id12=%.3f); 0xFD both\n",
+        std::fprintf(stderr, "ABORT |tau|>%.1f (id6=%.3f id12=%.3f); P5 disable-all 0xFD\n",
                      static_cast<double>(kAbortTauNm), static_cast<double>(tau6),
                      static_cast<double>(tau12));
+        biped_hw::safety_set_reason(biped_hw::SafetyReason::HardLimitTau);
         abort_tau = true;
         g_run = 0;
       }
@@ -962,7 +748,7 @@ int main(int argc, char **argv)
           st.mbs[static_cast<std::size_t>(idx)].valid = false;
         }
         biped_hw::MbsSample sample{};
-        if (!poll_mbs_once(mbs_serial, addr, opt.mbs_timeout_ms, opt.mbs_rts_de,
+        if (!biped_hw::mbs_bus_poll_once(mbs_serial, addr, opt.mbs_timeout_ms, opt.mbs_rts_de,
                            sample))
         {
           return;
@@ -1015,7 +801,13 @@ int main(int argc, char **argv)
   }
 
   print_summary(st, abort_tau);
-  disable_knees_now(true);
+  if (opt.enable_knees)
+  {
+    disable_all_now(true);
+    g_left = nullptr;
+    g_right = nullptr;
+    biped_hw::safety_bind_buses(nullptr, nullptr);
+  }
 
   if (imu_exec)
   {
@@ -1028,3 +820,5 @@ int main(int argc, char **argv)
   }
   return abort_tau ? 1 : 0;
 }
+
+}  // namespace

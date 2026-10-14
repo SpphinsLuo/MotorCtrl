@@ -28,6 +28,12 @@ enum class MotorType : uint8_t
   HA60,
 };
 
+inline constexpr bool is_damiao_mit(MotorType type)
+{
+  return type == MotorType::DM10010L || type == MotorType::DM10010 ||
+         type == MotorType::DM10422;
+}
+
 enum class JointId : uint8_t
 {
   LHipYaw = 0,
@@ -53,17 +59,18 @@ inline constexpr uint8_t kMasterId = 0x02;
 // payload D[0] low nibble (ESC_ID), not by the USB-CAN reported canId.
 // Official SDK: https://gitee.com/kit-miao/damiao (motor-sdk). Do not vendor it.
 //
-// Pack-range defaults (PMAX / VMAX / TMAX). DM10422 is UNVERIFIED — read
-// RID 21/22/23 at runtime if needed. HA60 ranges are Motorevo (not Damiao MIT).
+// Pack-range defaults (PMAX / VMAX / TMAX). Firmware RID 21/22/23 overrides
+// at runtime when successfully read. HA60 ranges are Motorevo (not Damiao MIT).
 struct LimitParam
 {
-  float q_max = 0.f;
-  float dq_max = 0.f;
-  float tau_max = 0.f;
+  float q_max = 0.f;//单位：rad
+  float dq_max = 0.f;//单位：rps  
+  float tau_max = 0.f;//单位：Nm  
 };
 
 inline constexpr LimitParam kLimitDm10010L{12.5f, 25.f, 200.f};
 inline constexpr LimitParam kLimitDm10010{12.5f, 20.f, 200.f};
+inline constexpr LimitParam kLimitDm10422{12.5f, 20.f, 400.f};
 inline constexpr LimitParam kLimitHa60{12.5f, 10.f, 50.f};
 
 inline LimitParam default_limit(MotorType type)
@@ -77,7 +84,7 @@ inline LimitParam default_limit(MotorType type)
   case MotorType::HA60:
     return kLimitHa60;
   case MotorType::DM10422:
-    return kLimitDm10010;  // UNVERIFIED placeholder
+    return kLimitDm10422;
   }
   return kLimitDm10010L;
 }

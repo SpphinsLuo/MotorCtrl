@@ -1,6 +1,7 @@
 // biped_hw — bus_cycle.hpp
 // P3 同周期 write-all / drain-all：先把本总线指令发完，再在超时内收齐期望 ID。
-// 缺电机记 drop，不无限等待。双总线 v1：先左后右发送，再交错收包（不用线程）。
+// 缺电机记 drop，不无限等待。双总线：同进程先双发，再对两个 USB-CAN fd 一次
+// select() 同收（elapsed = max，不是两次 SerialPort 超时之和）。
 #pragma once
 
 #include "biped_hw/cycle_logger.hpp"
@@ -82,7 +83,9 @@ public:
   void begin_tick(const std::vector<CycleMotorCmd> &cmds, BusCycleInflight &io,
                   CycleLogger *log);
 
-  // One pollCan burst + demux extract. Bounded by SerialPort timeout (~2 ms).
+  // One pollCan burst + demux extract. First recv uses the adapter timeout;
+  // further recvs in this burst are timeout 0 so complete_rx is not delayed
+  // by another SerialPort select quantum (~2 ms).
   void poll_once(BusCycleInflight &io, CycleLogger *log);
 
   // Mark leftovers as drop. period is only used for overrun vs elapsed.
@@ -97,6 +100,7 @@ public:
 private:
   int index_of(BusCycleInflight &io, uint8_t can_id) const;
   void complete_rx(BusCycleInflight &io, int idx, const DmFeedback *fb, CycleLogger *log);
+  void harvest_rx(BusCycleInflight &io, CycleLogger *log);
 
   UsbCanAdapter *adapter_ = nullptr;
   BusId bus_ = BusId::Left;
@@ -113,12 +117,22 @@ struct DualBusCycleResult
   bool right_used = false;
 };
 
-// v1: send left all, send right all, then interleaved drain until a shared deadline.
-// No worker threads. If only one adapter is set, that side runs alone.
+// Same process: send left all, send right all, then one select() on both
+// adapter fds until a shared deadline. Whichever fd is readable is drained
+// with timeout 0 and stamped immediately. SerialPort::recv select()s one fd,
+// so waiting on both in the same call is what actually overlaps the waits.
+// Each adapter/logger/demux is used by this thread only. If only one adapter
+// is set, that side runs alone (same as BusCycle::tick).
 class DualBusCycle
 {
 public:
   DualBusCycle(BusCycle *left, BusCycle *right);
+  ~DualBusCycle() = default;
+
+  DualBusCycle(const DualBusCycle &) = delete;
+  DualBusCycle &operator=(const DualBusCycle &) = delete;
+  DualBusCycle(DualBusCycle &&) = delete;
+  DualBusCycle &operator=(DualBusCycle &&) = delete;
 
   DualBusCycleResult tick(const std::vector<CycleMotorCmd> *left_cmds,
                           const std::vector<CycleMotorCmd> *right_cmds,

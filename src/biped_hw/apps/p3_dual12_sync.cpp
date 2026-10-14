@@ -1,5 +1,5 @@
-// biped_hw — p3_dual12_sync.cpp
-// P3 双总线 12 路同周期：先左后右发送，再交错收包。ttyACM1 缺失时报错，
+// 双腿12电机协同测试程序
+// P3 双总线 12 路同周期：先左后右发送，再两路同时收包。ttyACM1 缺失时报错，
 // 加 --allow-single-bus 则只跑左腿。默认 --ids 6、跳过 Motorevo 8/14。
 #include "biped_hw/p3_runtime.hpp"
 

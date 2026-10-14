@@ -11,6 +11,9 @@
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
+#include <limits.h>
+#include <cstdlib>
+#include <cstring>
 #include <linux/serial.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
@@ -454,32 +457,55 @@ void SerialPort::recv(uint8_t *data, uint8_t head, ssize_t len)
     return;
   }
 
+  auto try_extract = [&]() -> bool {
+    while (recv_queue_.size() >= static_cast<size_t>(len))
+    {
+      if (recv_queue_.front() != head)
+      {
+        recv_queue_.pop();
+        continue;
+      }
+      for (ssize_t i = 0; i < len; ++i)
+      {
+        data[i] = recv_queue_.front();
+        recv_queue_.pop();
+      }
+      return true;
+    }
+    return false;
+  };
+
+  // A full frame already in the userspace queue must not wait on select().
+  if (try_extract())
+  {
+    return;
+  }
+
   const ssize_t n = this->recv(recv_buf_.data(), static_cast<size_t>(len));
   for (ssize_t i = 0; i < n; ++i)
   {
     recv_queue_.push(recv_buf_[static_cast<size_t>(i)]);
   }
+  (void)try_extract();
+}
 
-  while (recv_queue_.size() >= static_cast<size_t>(len))
+std::string tty_driver_name(const std::string &port)
+{
+  char resolved[PATH_MAX];
+  const char *p = ::realpath(port.c_str(), resolved) ? resolved : port.c_str();
+  const char *slash = std::strrchr(p, '/');
+  const std::string name = slash == nullptr ? std::string(p) : std::string(slash + 1);
+  const std::string path = "/sys/class/tty/" + name + "/device/driver";
+  char buf[256];
+  const ssize_t n = ::readlink(path.c_str(), buf, sizeof(buf) - 1);
+  if (n <= 0)
   {
-    if (recv_queue_.front() != head)
-    {
-      recv_queue_.pop();
-      continue;
-    }
-    break;
+    return {};
   }
-
-  if (recv_queue_.size() < static_cast<size_t>(len))
-  {
-    return;
-  }
-
-  for (ssize_t i = 0; i < len; ++i)
-  {
-    data[i] = recv_queue_.front();
-    recv_queue_.pop();
-  }
+  buf[n] = '\0';
+  std::string link(buf);
+  const auto last = link.find_last_of('/');
+  return last == std::string::npos ? link : link.substr(last + 1);
 }
 
 }  // namespace biped_hw

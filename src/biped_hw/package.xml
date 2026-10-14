@@ -13,6 +13,8 @@
     P3 dual-bus: p3_dual_knee_spin (left CAN 6 ACM0 + right CAN 9 ACM1 Damiao MIT slow ramp).
     MBS magnetic encoder RS485 poll: mbs_encoder_recv (USB-RS485 by-id, not ttyUSB0).
     P4 RobotState dump: p4_state_dump (listen-only or --enable-knees 6+12 hold + MBS + /imu latch).
+    Hip parallel FK/IK: hip_parallel_kin + p4_hip_kin_self_test (no hardware).
+    P6 getState/sendCommand + quintic_traj: p6_traj_track (quintic about probe q0; default right 9-14; --self-test).
   </description>
   <maintainer email="lanluo@todo.todo">lanluo</maintainer>
   <license>Apache-2.0</license>

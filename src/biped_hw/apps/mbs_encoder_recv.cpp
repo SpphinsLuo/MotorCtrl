@@ -1,11 +1,12 @@
-// biped_hw — mbs_encoder_recv.cpp
+// 金刚 磁编码器数据接收程序。
 // MBS 磁编码器 USB-RS485 轮询。默认口来自 config/mbs_encoder.yaml 的 by-id，
-// 不是 /dev/ttyUSB0（N100 IMU 的 cp210x 也会占 ttyUSB*，插拔会换号）。
-// SKU MBS-15-45-A-17-D-N-A-M 的 D 是 BUS 高速总线（手册 v2.7），不是协议 R。
+// MBS通信协议采用BUS 高速总线（手册 v2.7），不是RS485,但仍通过485接口实现。
 // BUS：TX 1 字节 [奇校验|op|addr]，默认地址 0x1F，UART 8N1 固定 2.5 Mbps，
 // 回 B0=请求 + S A0 A1 A2 + XOR CRC。协议 R 的 0x64 在 D 上 op=0b11 → 无应答。
 // 附加 A=115200 仅接口 R/A；本 SKU 的 A 是温度档，M 是无附加。不打开 ttyACM*。
+#include "biped_hw/cli.hpp"
 #include "biped_hw/mbs_codec.hpp"
+#include "biped_hw/mbs_host.hpp"
 #include "biped_hw/mbs_map.hpp"
 #include "biped_hw/serial_port.hpp"
 
@@ -70,14 +71,6 @@ bool baud_to_speed(unsigned baud, speed_t &out)
   }
 }
 
-unsigned parse_u(const char *s, bool &ok)
-{
-  char *end = nullptr;
-  const unsigned long v = std::strtoul(s, &end, 0);
-  ok = end != s && end != nullptr && *end == '\0';
-  return static_cast<unsigned>(v);
-}
-
 struct Options
 {
   std::string port;
@@ -99,6 +92,7 @@ struct Options
   bool rts_invert = false;
   bool map = false;
   bool addr_set = false;
+  bool set_zero = false;
 };
 
 void wait_us(int us)
@@ -141,9 +135,12 @@ void usage()
       "                        [--rate HZ] [--duration SEC] [--timeout-ms N]\n"
       "                        [--turnaround-us N] [--rts-de] [--no-rts-de]\n"
       "                        [--rts-invert] [--no-strip-echo] [--verbose]\n"
-      "                        [--self-test]\n"
+      "                        [--self-test] [--set-zero]\n"
       " sku=%s  --addr single-polls (default 0x1F). --map polls 8 yaml addrs\n"
-      " (4,5,6,7,10,11,12,13) sequential BUS-D. Do not combine --map and --addr.\n",
+      " (4,5,6,7,10,11,12,13) sequential BUS-D. Do not combine --map and --addr.\n"
+      " --set-zero WRITES encoder firmware/device zero at current shaft (BUS-D\n"
+      " SetZero); not a yaml zero_rad edit. One-shot then one GetInfo. Needs\n"
+      " --addr N or --map. Not with --duration / --iface r / --self-test.\n",
       biped_hw::kMbsSkuUser);
 }
 
@@ -170,12 +167,7 @@ bool parse_args(int argc, char **argv, Options &opt, std::string &err)
   for (int i = 1; i < argc; ++i)
   {
     auto need = [&](const char *flag) -> const char * {
-      if (i + 1 >= argc)
-      {
-        err = std::string(flag) + " needs a value";
-        return nullptr;
-      }
-      return argv[++i];
+      return biped_hw::need_arg(i, argc, argv, flag, err);
     };
     if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0)
     {
@@ -200,7 +192,7 @@ bool parse_args(int argc, char **argv, Options &opt, std::string &err)
         return false;
       }
       bool ok = false;
-      opt.baud = parse_u(v, ok);
+      opt.baud = biped_hw::parse_u(v, ok);
       if (!ok)
       {
         err = "bad --baud";
@@ -228,7 +220,7 @@ bool parse_args(int argc, char **argv, Options &opt, std::string &err)
         return false;
       }
       bool ok = false;
-      const unsigned a = parse_u(v, ok);
+      const unsigned a = biped_hw::parse_u(v, ok);
       if (!ok || a > biped_hw::kMbsBusAddrMask)
       {
         err = "--addr must be 0..31 (default 0x1F)";
@@ -249,7 +241,7 @@ bool parse_args(int argc, char **argv, Options &opt, std::string &err)
         return false;
       }
       bool ok = false;
-      const unsigned b = parse_u(v, ok);
+      const unsigned b = biped_hw::parse_u(v, ok);
       if (!ok || (b != 16 && b != 17))
       {
         err = "--bits must be 16 or 17";
@@ -274,7 +266,7 @@ bool parse_args(int argc, char **argv, Options &opt, std::string &err)
         return false;
       }
       bool ok = false;
-      const unsigned m = parse_u(v, ok);
+      const unsigned m = biped_hw::parse_u(v, ok);
       if (!ok || (m != 0 && m != 8 && m != 16))
       {
         err = "--multi-bits must be 0, 8, or 16";
@@ -291,7 +283,7 @@ bool parse_args(int argc, char **argv, Options &opt, std::string &err)
         return false;
       }
       bool ok = false;
-      const unsigned c = parse_u(v, ok);
+      const unsigned c = biped_hw::parse_u(v, ok);
       if (!ok)
       {
         err = "bad --cmd";
@@ -373,6 +365,10 @@ bool parse_args(int argc, char **argv, Options &opt, std::string &err)
     else if (std::strcmp(argv[i], "--self-test") == 0)
     {
       opt.self_test = true;
+    }
+    else if (std::strcmp(argv[i], "--set-zero") == 0)
+    {
+      opt.set_zero = true;
     }
     else if (std::strcmp(argv[i], "--no-strip-echo") == 0)
     {
@@ -569,30 +565,6 @@ bool resolve_encoder_port(Options &opt, biped_hw::MbsEncoderConfig &cfg, std::st
   return false;
 }
 
-std::string tty_basename(const std::string &port)
-{
-  char resolved[PATH_MAX];
-  const char *p = ::realpath(port.c_str(), resolved) ? resolved : port.c_str();
-  const char *slash = std::strrchr(p, '/');
-  return slash == nullptr ? std::string(p) : std::string(slash + 1);
-}
-
-std::string tty_driver_name(const std::string &port)
-{
-  const std::string name = tty_basename(port);
-  const std::string path = "/sys/class/tty/" + name + "/device/driver";
-  char buf[256];
-  const ssize_t n = ::readlink(path.c_str(), buf, sizeof(buf) - 1);
-  if (n <= 0)
-  {
-    return {};
-  }
-  buf[n] = '\0';
-  std::string link(buf);
-  const auto last = link.find_last_of('/');
-  return last == std::string::npos ? link : link.substr(last + 1);
-}
-
 void warn_high_baud(unsigned requested, unsigned linux_hz, const std::string &driver)
 {
   if (requested < 2000000u)
@@ -617,6 +589,8 @@ void warn_high_baud(unsigned requested, unsigned linux_hz, const std::string &dr
   }
 }
 
+int run(Options opt);
+
 }  // namespace
 
 int main(int argc, char **argv)
@@ -629,6 +603,11 @@ int main(int argc, char **argv)
     return 2;
   }
 
+  if (opt.set_zero && opt.self_test)
+  {
+    std::fprintf(stderr, "refuse: --set-zero cannot be combined with --self-test\n");
+    return 2;
+  }
   if (opt.self_test)
   {
     const int map_rc = biped_hw::mbs_map_self_test();
@@ -645,10 +624,10 @@ int main(int argc, char **argv)
     }
     std::printf(
         "mbs_codec self-test OK (no hardware; RS485-R 0x64 CRC-8 0x97 + "
-        "BUS-D addr 0x1F XOR CRC; 8-encoder map 4,5,6,7,10,11,12,13)\n");
+        "BUS-D addr 0x1F XOR CRC; SetZero 0xBF / addr 6,12; "
+        "8-encoder map 4,5,6,7,10,11,12,13)\n");
     return 0;
   }
-
   if (opt.map && opt.addr_set)
   {
     std::fprintf(stderr, "use --addr (single) or --map (8 yaml addrs), not both\n");
@@ -659,7 +638,31 @@ int main(int argc, char **argv)
     std::fprintf(stderr, "--map is BUS-D only (this SKU is ...-D-...)\n");
     return 2;
   }
+  if (opt.set_zero && opt.iface != biped_hw::MbsIface::BusD)
+  {
+    std::fprintf(stderr, "--set-zero is BUS-D only (RS485-R 0x30 unused on this SKU)\n");
+    return 2;
+  }
+  if (opt.set_zero && !opt.addr_set && !opt.map)
+  {
+    std::fprintf(stderr, "--set-zero needs --addr N or --map\n");
+    return 2;
+  }
+  if (opt.set_zero && opt.duration_s > 0.0)
+  {
+    std::fprintf(stderr,
+                 "refuse: --set-zero is one-shot then one GetInfo; not with --duration\n");
+    return 2;
+  }
+  return run(opt);
+}
 
+namespace
+{
+
+int run(Options opt)
+{
+  std::string err;
   biped_hw::MbsEncoderConfig cfg;
   if (!resolve_encoder_port(opt, cfg, err))
   {
@@ -726,13 +729,43 @@ int main(int argc, char **argv)
           : static_cast<uint8_t>(opt.layout.cmd);
   const std::size_t reply_n =
       bus ? biped_hw::mbs_bus_reply_size(opt.bus) : biped_hw::mbs_reply_size(opt.layout);
-  const std::string driver = tty_driver_name(opt.port);
+  const std::string driver = biped_hw::tty_driver_name(opt.port);
   if (!opt.rts_de_set && driver == "pl2303")
   {
     opt.rts_de = true;
   }
 
-  if (bus)
+  if (bus && opt.set_zero)
+  {
+    if (opt.map)
+    {
+      std::printf(
+          "MBS BUS-D set-zero sku=%s port=%s baud=%u uart=8N1 map8 addrs=",
+          biped_hw::kMbsSkuUser, opt.port.c_str(), opt.baud);
+      for (std::size_t i = 0; i < targets.size(); ++i)
+      {
+        std::printf("%s%u", i == 0 ? "" : ",", static_cast<unsigned>(targets[i].addr));
+      }
+      std::printf(
+          " (device origin at current shaft, not yaml zero_rad) "
+          "rts_de=%d driver=%s\n",
+          opt.rts_de ? 1 : 0, driver.empty() ? "?" : driver.c_str());
+    }
+    else
+    {
+      const uint8_t zero_tx =
+          biped_hw::mbs_bus_request(biped_hw::MbsBusOp::SetZero, targets.front().addr);
+      std::printf(
+          "MBS BUS-D set-zero sku=%s port=%s baud=%u uart=8N1 addr=0x%02X "
+          "req=0x%02X (device origin at current shaft, not yaml zero_rad) "
+          "rts_de=%d driver=%s\n",
+          biped_hw::kMbsSkuUser, opt.port.c_str(), opt.baud,
+          static_cast<unsigned>(targets.front().addr),
+          static_cast<unsigned>(zero_tx), opt.rts_de ? 1 : 0,
+          driver.empty() ? "?" : driver.c_str());
+    }
+  }
+  else if (bus)
   {
     if (opt.map)
     {
@@ -811,6 +844,59 @@ int main(int argc, char **argv)
     std::printf(
         "RTS held off for auto-DE (TIOCM_RTS cleared, DTR unchanged). "
         "If rx=0 the board may need RTS to enable the transceiver at all.\n");
+  }
+
+  if (opt.set_zero)
+  {
+    std::fprintf(stderr,
+                 "WARN: --set-zero WRITES encoder device zero at current shaft "
+                 "(BUS-D SetZero). Not yaml zero_rad.\n");
+    bool any_info = false;
+    for (const auto &tgt : targets)
+    {
+      const uint8_t tx =
+          biped_hw::mbs_bus_request(biped_hw::MbsBusOp::SetZero, tgt.addr);
+      if (!biped_hw::mbs_bus_send_set_zero(serial, tgt.addr, opt.rts_de))
+      {
+        std::fprintf(stderr, "set-zero addr=%u tx=0x%02X failed\n",
+                     static_cast<unsigned>(tgt.addr), static_cast<unsigned>(tx));
+        return 1;
+      }
+      if (tgt.name != nullptr)
+      {
+        std::printf("set-zero addr=%u name=%s tx=0x%02X sent\n",
+                    static_cast<unsigned>(tgt.addr), tgt.name,
+                    static_cast<unsigned>(tx));
+      }
+      else
+      {
+        std::printf("set-zero addr=%u tx=0x%02X sent\n",
+                    static_cast<unsigned>(tgt.addr), static_cast<unsigned>(tx));
+      }
+      biped_hw::MbsSample sample{};
+      if (biped_hw::mbs_bus_poll_once(serial, tgt.addr, opt.timeout_ms, opt.rts_de,
+                                      sample))
+      {
+        any_info = true;
+        if (tgt.name != nullptr)
+        {
+          std::printf("addr=%u name=%s valid=1 ", static_cast<unsigned>(tgt.addr),
+                      tgt.name);
+        }
+        print_sample(sample, opt.verbose);
+      }
+      else if (tgt.name != nullptr)
+      {
+        std::printf("addr=%u name=%s valid=0 (GetInfo after SetZero)\n",
+                    static_cast<unsigned>(tgt.addr), tgt.name);
+      }
+      else
+      {
+        std::printf("addr=%u valid=0 (GetInfo after SetZero)\n",
+                    static_cast<unsigned>(tgt.addr));
+      }
+    }
+    return any_info ? 0 : 1;
   }
 
   std::signal(SIGINT, on_sigint);
@@ -1061,3 +1147,5 @@ int main(int argc, char **argv)
   }
   return samples > 0 ? 0 : 1;
 }
+
+}  // namespace

@@ -1,18 +1,17 @@
-// biped_hw — p3_dual_knee_spin.cpp
-// 双总线 Damiao MIT（默认左 ACM0 CAN 6 / 右 ACM1 CAN 12；--ids / --left-id /
-// --right-id 可改）。不要求关节名是膝：map 内 Damiao MIT + Master 2 即可。
-// 默认 --stage triangle：q_des += vel*dt，到 ±stroke 反向。
-// --stage dq：上位机同款 MIT：kp=0，kd 来自 --kd，dq_des=恒 --vel（上限 VMAX，
-// 不是 5% VMAX），q_des=0，tau=0；--duration 或 |q-q0|>=stroke 后 0xFD 两路。
+// 双膝电机测试程序（DM10422）
+// 双总线 Damiao MIT（默认左 ACM0 CAN 6 / 右 ACM1 CAN 12；--ids / --left-id /--right-id 可改）。map 内 Damiao MIT + Master 2 即可。
+// 默认 --stage triangle：q_des += vel*dt，到 ±stroke 反向。 
 // 只使能这两路，不碰其它 ID。
 // 必须打开两路 USB2CAN；缺右总线直接失败。CTRL_MODE=MIT、RID 21/22/23。退出发 0xFD。
-// Probe：右适配器单独 MIT 询问（kp=0）并打印 ACM1 原始 RX；失败再扫右总线 1–14。
 #include "biped_hw/bus_cycle.hpp"
+#include "biped_hw/cli.hpp"
 #include "biped_hw/cycle_logger.hpp"
 #include "biped_hw/dm_codec.hpp"
+#include "biped_hw/dm_mit_host.hpp"
 #include "biped_hw/frame_demux.hpp"
 #include "biped_hw/metrics.hpp"
 #include "biped_hw/motor_map.hpp"
+#include "biped_hw/safety.hpp"
 #include "biped_hw/usb_can_adapter.hpp"
 
 #include <algorithm>
@@ -36,10 +35,6 @@ constexpr uint8_t kRightId = 12;
 constexpr int kEnableSettleUs = 100000;
 constexpr int kDisableGapUs = 10000;
 constexpr int kProbeTicks = 20;          // dual-bus; 3 was too short for ACM1
-constexpr int kRightProbeTicks = 15;     // MIT inquiry on right adapter only
-constexpr int kRightProbeWaitMs = 40;
-constexpr int kRightScanWaitMs = 40;
-constexpr int kRightScanMaxId = 14;
 constexpr float kKpDefault = 80.f;
 constexpr float kKdDefault = 1.f;
 constexpr float kKpCap = 200.f;  // 达妙 MIT kp 0-500；P3 hold 的 20 会夹死斜坡
@@ -53,207 +48,27 @@ constexpr double kDurationDefault = 120.0;
 std::atomic<bool> g_run{true};
 biped_hw::UsbCanAdapter *g_left = nullptr;
 biped_hw::UsbCanAdapter *g_right = nullptr;
-biped_hw::UsbCanAdapter *g_disable_ad[2] = {};
-uint8_t g_disable_ids[2] = {};
-std::size_t g_disable_n = 0;
 
 void on_signal(int)
 {
   g_run.store(false);
-}
-
-void send_disable(biped_hw::UsbCanAdapter *a, uint8_t id)
-{
-  if (a == nullptr || !a->is_open())
-  {
-    return;
-  }
-  uint8_t buf[8] = {};
-  biped_hw::pack_disable(buf);
-  a->sendCan(id, buf, 8);
-  usleep(kDisableGapUs);
-  a->sendCan(id, buf, 8);
+  biped_hw::safety_estop_trip();
 }
 
 void disable_all_now(bool print)
 {
-  for (std::size_t i = 0; i < g_disable_n; ++i)
-  {
-    const uint8_t id = g_disable_ids[i];
-    send_disable(g_disable_ad[i], id);
-    if (print)
-    {
-      std::printf("disable id=%u sent (0xFD)\n", static_cast<unsigned>(id));
-    }
-  }
-  g_disable_n = 0;
+  const auto r = biped_hw::safety_estop_latched() ? biped_hw::SafetyReason::Estop
+                                                  : biped_hw::safety_last_reason();
+  biped_hw::safety_disable_all(
+      g_left, g_right, nullptr, 0,
+      r == biped_hw::SafetyReason::None ? biped_hw::SafetyReason::Estop : r, print);
 }
 
 void atexit_disable()
 {
-  disable_all_now(false);
+  biped_hw::safety_atexit_disable();
 }
 
-void arm_disable_slot(biped_hw::UsbCanAdapter *a, uint8_t id)
-{
-  if (a == nullptr || g_disable_n >= 2)
-  {
-    return;
-  }
-  g_disable_ad[g_disable_n] = a;
-  g_disable_ids[g_disable_n] = id;
-  ++g_disable_n;
-}
-
-bool is_damiao_mit(biped_hw::MotorType type)
-{
-  return type == biped_hw::MotorType::DM10010L || type == biped_hw::MotorType::DM10010 ||
-         type == biped_hw::MotorType::DM10422;
-}
-
-bool mapped_damiao_mit_master2(uint8_t id)
-{
-  const auto *e = biped_hw::find_by_can_id(id);
-  return e != nullptr && e->master_id == biped_hw::kMasterId && is_damiao_mit(e->model);
-}
-
-std::string trim_copy(std::string s)
-{
-  const auto a = s.find_first_not_of(" \t\r\n");
-  if (a == std::string::npos)
-  {
-    return {};
-  }
-  const auto b = s.find_last_not_of(" \t\r\n");
-  return s.substr(a, b - a + 1);
-}
-
-bool yaml_ports(const std::string &path, std::string &left, std::string &right)
-{
-  std::ifstream in(path);
-  if (!in)
-  {
-    return false;
-  }
-  std::string line;
-  int section = 0;
-  bool got = false;
-  while (std::getline(in, line))
-  {
-    const auto hash = line.find('#');
-    if (hash != std::string::npos)
-    {
-      line = line.substr(0, hash);
-    }
-    const std::string t = trim_copy(line);
-    if (t.empty())
-    {
-      continue;
-    }
-    if (t.find("left:") == 0)
-    {
-      section = 1;
-      continue;
-    }
-    if (t.find("right:") == 0)
-    {
-      section = 2;
-      continue;
-    }
-    if (t.find("port:") != 0)
-    {
-      continue;
-    }
-    const std::string v = trim_copy(t.substr(5));
-    if (section == 1)
-    {
-      left = v;
-      got = true;
-    }
-    else if (section == 2)
-    {
-      right = v;
-      got = true;
-    }
-  }
-  return got;
-}
-
-const char *need_arg(int &i, int argc, char **argv, const char *flag, std::string &err)
-{
-  if (i + 1 >= argc)
-  {
-    err = std::string(flag) + " needs a value";
-    return nullptr;
-  }
-  return argv[++i];
-}
-
-bool wait_register(biped_hw::UsbCanAdapter &adapter, biped_hw::FrameDemux &demux, uint8_t esc_id,
-                   uint8_t rid, biped_hw::DmRegisterReply &reply, int timeout_ms)
-{
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-  while (std::chrono::steady_clock::now() < deadline)
-  {
-    biped_hw::CanRxFrame rx;
-    if (adapter.pollCan(rx))
-    {
-      demux.push(rx);
-    }
-    if (demux.take_register(esc_id, rid, reply))
-    {
-      return true;
-    }
-  }
-  return false;
-}
-
-bool read_rid_retries(biped_hw::UsbCanAdapter &adapter, biped_hw::FrameDemux &demux, uint8_t esc_id,
-                      uint8_t rid, float &value)
-{
-  for (int i = 0; i < 3; ++i)
-  {
-    demux.clear();
-    uint8_t buf[8] = {};
-    biped_hw::pack_register_read(buf, esc_id, rid);
-    if (!adapter.sendCan(biped_hw::kDmRegCanId, buf, 8))
-    {
-      continue;
-    }
-    biped_hw::DmRegisterReply reply{};
-    if (wait_register(adapter, demux, esc_id, rid, reply, 200))
-    {
-      value = reply.f;
-      return true;
-    }
-  }
-  return false;
-}
-
-bool write_rid_u32_retries(biped_hw::UsbCanAdapter &adapter, biped_hw::FrameDemux &demux,
-                           uint8_t esc_id, uint8_t rid, uint32_t value)
-{
-  for (int i = 0; i < 3; ++i)
-  {
-    demux.clear();
-    uint8_t buf[8] = {};
-    biped_hw::pack_register_write_u32(buf, esc_id, rid, value);
-    if (!adapter.sendCan(biped_hw::kDmRegCanId, buf, 8))
-    {
-      continue;
-    }
-    biped_hw::DmRegisterReply reply{};
-    if (wait_register(adapter, demux, esc_id, rid, reply, 200))
-    {
-      if (reply.u == value || static_cast<uint32_t>(reply.f + 0.5f) == value)
-      {
-        return true;
-      }
-    }
-  }
-  return false;
-}
 
 struct Knee
 {
@@ -341,151 +156,6 @@ void accumulate(Knee *knees, std::size_t n, const biped_hw::BusCycleResult &r)
   }
 }
 
-void print_rx_raw(const char *tag, const biped_hw::CanRxFrame &rx, uint8_t expect_id)
-{
-  const uint8_t esc = static_cast<uint8_t>(rx.data[0] & 0x0F);
-  const char *hint = "other";
-  if (rx.can_id == biped_hw::kMasterId && esc == expect_id)
-  {
-    hint = "MST2+esc=expect (demux should match)";
-  }
-  else if (rx.can_id == expect_id)
-  {
-    hint = "slave-id CAN (treat as feedback)";
-  }
-  else if (rx.can_id == biped_hw::kMasterId && esc == 6)
-  {
-    hint = "MST2 esc=6 (motor still ID 6?)";
-  }
-  else if (rx.can_id == biped_hw::kMasterId)
-  {
-    hint = "MST2 other esc";
-  }
-  else if (esc == expect_id)
-  {
-    hint = "esc=expect but CAN!=2 (MST_ID changed?)";
-  }
-  else if (rx.can_id == 6)
-  {
-    hint = "CAN 6 slave-id";
-  }
-  std::printf("%s RX can=0x%X (%u) dlc=%u D[0]=0x%02X esc=%u expect=%u [%s] data=", tag,
-              rx.can_id, rx.can_id, static_cast<unsigned>(rx.dlc),
-              static_cast<unsigned>(rx.data[0]), static_cast<unsigned>(esc),
-              static_cast<unsigned>(expect_id), hint);
-  const unsigned n = rx.dlc < 8 ? rx.dlc : 8;
-  for (unsigned i = 0; i < n; ++i)
-  {
-    std::printf("%02X%s", static_cast<unsigned>(rx.data[i]), i + 1u < n ? " " : "");
-  }
-  std::printf("\n");
-}
-
-bool mark_from_rx(Knee &k, const biped_hw::CanRxFrame &rx, bool set_q0)
-{
-  const uint8_t esc = static_cast<uint8_t>(rx.data[0] & 0x0F);
-  const bool nibble_ok = (esc == k.can_id && rx.dlc >= 6);
-  const bool slave = (rx.can_id == k.can_id && rx.dlc >= 6);
-  if (!nibble_ok && !slave)
-  {
-    return false;
-  }
-  biped_hw::DmFeedback fb{};
-  if (!biped_hw::unpack_mit_feedback(rx.data, rx.dlc, rx.can_id, k.lim, fb))
-  {
-    k.present = true;
-    return true;
-  }
-  k.present = true;
-  k.last_q = fb.q;
-  k.last_tau = fb.tau;
-  k.last_dq = fb.dq;
-  k.have_q = true;
-  if (set_q0)
-  {
-    k.q0 = fb.q;
-    k.q_des = fb.q;
-  }
-  return true;
-}
-
-// MIT inquiry (kp=0) on one adapter only. Never enable. Dumps every ACM RX frame.
-int probe_adapter_raw(biped_hw::UsbCanAdapter &ad, Knee &k, int ticks, int wait_ms,
-                      const char *tag, bool set_q0)
-{
-  uint8_t mit[8] = {};
-  biped_hw::pack_mit(mit, 0.f, 0.f, 0.f, 0.f, 0.f, k.lim);
-  int raw_n = 0;
-  ad.drain();
-  for (int t = 0; t < ticks && g_run.load(); ++t)
-  {
-    if (!ad.sendCan(k.can_id, mit, 8))
-    {
-      std::printf("%s TX FAIL tick=%d id=%u\n", tag, t, static_cast<unsigned>(k.can_id));
-      continue;
-    }
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
-    while (std::chrono::steady_clock::now() < deadline)
-    {
-      biped_hw::CanRxFrame rx;
-      if (!ad.pollCan(rx))
-      {
-        continue;
-      }
-      ++raw_n;
-      print_rx_raw(tag, rx, k.can_id);
-      mark_from_rx(k, rx, set_q0);
-    }
-  }
-  return raw_n;
-}
-
-void scan_right_bus(biped_hw::UsbCanAdapter &ad, const biped_hw::LimitParam &lim)
-{
-  std::printf("=== right-scan ACM1 ids 1-%d MIT kp=0 (no enable) — paste these ===\n",
-              kRightScanMaxId);
-  uint8_t mit[8] = {};
-  biped_hw::pack_mit(mit, 0.f, 0.f, 0.f, 0.f, 0.f, lim);
-  int hits = 0;
-  for (uint8_t id = 1; id <= kRightScanMaxId && g_run.load(); ++id)
-  {
-    ad.drain();
-    if (!ad.sendCan(id, mit, 8))
-    {
-      std::printf("right-scan id=%u TX FAIL\n", static_cast<unsigned>(id));
-      continue;
-    }
-    bool any = false;
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(kRightScanWaitMs);
-    while (std::chrono::steady_clock::now() < deadline)
-    {
-      biped_hw::CanRxFrame rx;
-      if (!ad.pollCan(rx))
-      {
-        continue;
-      }
-      any = true;
-      ++hits;
-      print_rx_raw("right-scan", rx, id);
-    }
-    if (!any)
-    {
-      std::printf("right-scan id=%u -> (no RX)\n", static_cast<unsigned>(id));
-    }
-  }
-  if (hits == 0)
-  {
-    std::printf("right-scan: 无任何回包 → 右总线接线/供电/波特率，或适配器未真正进 CAN。\n");
-  }
-  else
-  {
-    std::printf("right-scan: %d 帧。看 can/esc：%u=对（右 ID）；esc=6 且 can=2 或 6=仍是左总线电机。\n",
-                hits, static_cast<unsigned>(kRightId));
-  }
-}
-
 void print_usage()
 {
   std::printf(
@@ -500,6 +170,13 @@ void print_usage()
       "                        Periodic send (--period-ms). Hard stop: --duration OR\n"
       "                        |q-q0|>=--stroke then 0xFD both. Example:\n"
       "                        --stage dq --vel 5 --kd 2 --stroke 8 --duration 3 --abort-tau 15\n"
+      "                        Before triangle/dq: each selected ID is probed; if\n"
+      "                        |q|>%.3f rad (kDmHomeEpsRad), speed-limited MIT return\n"
+      "                        to 0 (kp=0, kd from --kd default %.0f, dq_des=-sign(q)*vel,\n"
+      "                        vel from --vel capped %.0f–%.0f rad/s) until |q|<=eps,\n"
+      "                        timeout max(%.0f, |q|/min(vel,%.0f)+%.0f) cap %.0f s, or abort-tau.\n"
+      "                        Then the loop. Homing fail → P5 disable-all 0xFD, no\n"
+      "                        profile. Skipped for --set-zero / --self-test. Not 0xFE.\n"
       "  --ids L,R             left,right CAN IDs (default %u,%u); same as --left-id/--right-id\n"
       "  --left-id N           left-bus ESC (default %u)\n"
       "  --right-id N          right-bus ESC (default %u); may equal left-id (separate buses)\n"
@@ -517,7 +194,16 @@ void print_usage()
       "  --abort-q-margin RAD  abort if |q-q0| > stroke+margin (default %.2f)\n"
       "  --left-port --right-port --yaml PATH\n"
       "  --handshake --verbose --self-test\n"
-      "  Disable 0xFD on both IDs at exit/SIGINT. Probe/scan never enable.\n",
+      "  --set-zero            WRITES firmware zero on BOTH selected knee IDs\n"
+      "                        (MIT 0xFE). Not triangle/dq. Mutually exclusive\n"
+      "                        with --stage. Same ports as the run. No 0xFC;\n"
+      "                        then 0xFD disable hygiene on those two IDs.\n"
+      "  Fault/abort/SIGINT: P5 disable-all 0xFD on map 3-14 (both buses).\n",
+      static_cast<double>(biped_hw::kDmHomeEpsRad), static_cast<double>(kKdDefault),
+      static_cast<double>(biped_hw::kDmHomeVel), static_cast<double>(biped_hw::kDmHomeVelMax),
+      static_cast<double>(biped_hw::kDmHomeTimeoutS), static_cast<double>(biped_hw::kDmHomeVel),
+      static_cast<double>(biped_hw::kDmHomeTimeoutSlackS),
+      static_cast<double>(biped_hw::kDmHomeTimeoutMaxS),
       static_cast<unsigned>(kLeftId), static_cast<unsigned>(kRightId),
       static_cast<unsigned>(kLeftId), static_cast<unsigned>(kRightId),
       kDurationDefault, static_cast<double>(kVelDefault), static_cast<double>(kStrokeDefault),
@@ -546,6 +232,8 @@ struct Options
   bool verbose = false;
   bool self_test = false;
   bool stage_dq = false;  // default triangle
+  bool stage_set = false;
+  bool set_zero = false;
 };
 
 bool parse_args(int argc, char **argv, Options &opt, std::string &err)
@@ -563,7 +251,7 @@ bool parse_args(int argc, char **argv, Options &opt, std::string &err)
       return false;
     }
     auto need = [&](const char *flag) -> const char * {
-      return need_arg(i, argc, argv, flag, err);
+      return biped_hw::need_arg(i, argc, argv, flag, err);
     };
     if (std::strcmp(argv[i], "--period-ms") == 0)
     {
@@ -746,6 +434,11 @@ bool parse_args(int argc, char **argv, Options &opt, std::string &err)
         err = "--stage must be triangle|dq";
         return false;
       }
+      opt.stage_set = true;
+    }
+    else if (std::strcmp(argv[i], "--set-zero") == 0)
+    {
+      opt.set_zero = true;
     }
     else if (std::strcmp(argv[i], "--handshake") == 0)
     {
@@ -766,10 +459,16 @@ bool parse_args(int argc, char **argv, Options &opt, std::string &err)
     }
   }
 
+  if (opt.set_zero && opt.stage_set)
+  {
+    err = "refuse: --set-zero cannot be combined with --stage";
+    return false;
+  }
+
   if (!opt.yaml_path.empty() && (!left_port_set || !right_port_set))
   {
     std::string yl, yr;
-    if (!yaml_ports(opt.yaml_path, yl, yr))
+    if (!biped_hw::yaml_bus_ports(opt.yaml_path, &yl, &yr))
     {
       err = "yaml overlay missing buses.*.port: " + opt.yaml_path;
       return false;
@@ -860,61 +559,34 @@ biped_hw::CycleMotorCmd make_cmd(const Knee &k, bool send, float kp, float kd, f
 
 bool enable_knee(Knee &k, biped_hw::UsbCanAdapter &ad, biped_hw::FrameDemux &dm)
 {
-  float pmax = 0.f, vmax = 0.f, tmax = 0.f;
-  const bool pok = read_rid_retries(ad, dm, k.can_id, static_cast<uint8_t>(biped_hw::DmRid::Pmax),
-                                    pmax);
-  const bool vok = read_rid_retries(ad, dm, k.can_id, static_cast<uint8_t>(biped_hw::DmRid::Vmax),
-                                    vmax);
-  const bool tok = read_rid_retries(ad, dm, k.can_id, static_cast<uint8_t>(biped_hw::DmRid::Tmax),
-                                    tmax);
+  biped_hw::DmMitEnableStatus st;
+  const biped_hw::DmMitEnableErr en =
+      biped_hw::dm_enable_mit(ad, dm, k.can_id, true, st);
   std::printf("id=%u RID 21/22/23 PMAX=%s%.4f VMAX=%s%.4f TMAX=%s%.4f\n",
-              static_cast<unsigned>(k.can_id), pok ? "" : "FAIL ", static_cast<double>(pmax),
-              vok ? "" : "FAIL ", static_cast<double>(vmax), tok ? "" : "FAIL ",
-              static_cast<double>(tmax));
-  if (!(pok && vok && tok && pmax > 0.1f && vmax > 0.1f && tmax > 0.1f))
+              static_cast<unsigned>(k.can_id), st.pmax_ok ? "" : "FAIL ",
+              static_cast<double>(st.pmax), st.vmax_ok ? "" : "FAIL ",
+              static_cast<double>(st.vmax), st.tmax_ok ? "" : "FAIL ",
+              static_cast<double>(st.tmax));
+  if (en == biped_hw::DmMitEnableErr::Rid)
   {
     std::fprintf(stderr,
                  "REFUSE enable id=%u: Damiao MIT limits UNVERIFIED (RID 21/22/23 failed)\n",
                  static_cast<unsigned>(k.can_id));
     return false;
   }
-  k.lim = biped_hw::LimitParam{pmax, vmax, tmax};
-
-  uint8_t dis[8] = {};
-  biped_hw::pack_disable(dis);
-  ad.sendCan(k.can_id, dis, 8);
-  usleep(kDisableGapUs);
-  ad.sendCan(k.can_id, dis, 8);
-  usleep(kDisableGapUs);
-  ad.drain();
-  dm.clear();
-
-  float mode_f = 0.f;
-  const bool before_ok =
-      read_rid_retries(ad, dm, k.can_id, static_cast<uint8_t>(biped_hw::DmRid::CtrlMode), mode_f);
-  const uint32_t before = static_cast<uint32_t>(mode_f + 0.5f);
-  const bool wrote = write_rid_u32_retries(ad, dm, k.can_id,
-                                           static_cast<uint8_t>(biped_hw::DmRid::CtrlMode),
-                                           biped_hw::kDmMitMode);
-  usleep(20000);
-  mode_f = 0.f;
-  const bool after_ok =
-      read_rid_retries(ad, dm, k.can_id, static_cast<uint8_t>(biped_hw::DmRid::CtrlMode), mode_f);
-  const uint32_t after = static_cast<uint32_t>(mode_f + 0.5f);
+  k.lim = st.lim;
   std::printf("id=%u CTRL_MODE before=%s%u write=%s after=%s%u (%s)\n",
-              static_cast<unsigned>(k.can_id), before_ok ? "" : "FAIL ",
-              static_cast<unsigned>(before), wrote ? "ack" : "NO-ACK", after_ok ? "" : "FAIL ",
-              static_cast<unsigned>(after), biped_hw::dm_ctrl_mode_name(after));
-  if (!after_ok || after != biped_hw::kDmMitMode)
+              static_cast<unsigned>(k.can_id), st.ctrl_before_ok ? "" : "FAIL ",
+              static_cast<unsigned>(st.ctrl_before), st.wrote_ack ? "ack" : "NO-ACK",
+              st.ctrl_after_ok ? "" : "FAIL ", static_cast<unsigned>(st.ctrl_after),
+              biped_hw::dm_ctrl_mode_name(st.ctrl_after));
+  if (en == biped_hw::DmMitEnableErr::CtrlMode)
   {
     std::fprintf(stderr, "REFUSE enable id=%u: need CTRL_MODE=MIT(1)\n",
                  static_cast<unsigned>(k.can_id));
     return false;
   }
-
-  uint8_t en[8] = {};
-  biped_hw::pack_enable(en);
-  if (!ad.sendCan(k.can_id, en, 8))
+  if (en != biped_hw::DmMitEnableErr::Ok)
   {
     std::fprintf(stderr, "enable send failed id=%u\n", static_cast<unsigned>(k.can_id));
     return false;
@@ -963,45 +635,20 @@ void print_summary(const Knee knees[2], std::uint64_t overruns, std::uint64_t cy
               static_cast<unsigned long long>(overruns));
 }
 
-}  // namespace
-
-int main(int argc, char **argv)
+int run(Options opt)
 {
-  Options opt;
-  std::string err;
-  if (!parse_args(argc, argv, opt, err))
-  {
-    if (err == "help")
-    {
-      return 0;
-    }
-    std::fprintf(stderr, "%s\n", err.c_str());
-    return 2;
-  }
-
-  if (!biped_hw::dm_codec_self_check() || !biped_hw::bus_cycle_self_check())
-  {
-    std::fprintf(stderr, "codec/bus_cycle self-check failed\n");
-    return 1;
-  }
-  if (opt.self_test)
-  {
-    std::printf("p3_dual_knee_spin self-check OK (no hardware): dm_codec, bus_cycle\n");
-    return 0;
-  }
-
   const auto *map_l = biped_hw::find_by_can_id(opt.left_id);
   const auto *map_r = biped_hw::find_by_can_id(opt.right_id);
   // Dual-bus bring-up: accept mapped Damiao MIT Master 2. Do not require
   // knee joint names (ID 12 is right knee DM10422; ID 6 is left knee).
-  if (map_l == nullptr || !mapped_damiao_mit_master2(opt.left_id))
+  if (map_l == nullptr || !biped_hw::mapped_damiao_mit_master2(opt.left_id))
   {
     std::fprintf(stderr,
                  "motor map mismatch for CAN ID %u (need mapped Damiao MIT, Master 2)\n",
                  static_cast<unsigned>(opt.left_id));
     return 1;
   }
-  if (map_r == nullptr || !mapped_damiao_mit_master2(opt.right_id))
+  if (map_r == nullptr || !biped_hw::mapped_damiao_mit_master2(opt.right_id))
   {
     std::fprintf(stderr,
                  "motor map mismatch for CAN ID %u (need mapped Damiao MIT, Master 2)\n",
@@ -1012,6 +659,72 @@ int main(int argc, char **argv)
   {
     std::printf("NOTE: --left-id and --right-id are both %u (OK: separate ACM adapters)\n",
                 static_cast<unsigned>(opt.left_id));
+  }
+
+  if (opt.set_zero)
+  {
+    std::printf(
+        "\n"
+        "**********************************************************************\n"
+        "* WARN: --set-zero WRITES firmware zero at current shaft position.  *\n"
+        "* IDs %u and %u only (not 12-motor map). MIT 0xFE. No 0xFC.         *\n"
+        "* Irreversible-ish. Shafts must be at the intended origin.          *\n"
+        "**********************************************************************\n"
+        "left %s id=%u  right %s id=%u\n",
+        static_cast<unsigned>(opt.left_id), static_cast<unsigned>(opt.right_id),
+        opt.left_port.c_str(), static_cast<unsigned>(opt.left_id), opt.right_port.c_str(),
+        static_cast<unsigned>(opt.right_id));
+
+    biped_hw::UsbCanAdapter left_ad(opt.left_port);
+    biped_hw::UsbCanAdapter right_ad(opt.right_port);
+    if (!left_ad.open())
+    {
+      std::fprintf(stderr, "open left %s failed: %s\n", opt.left_port.c_str(),
+                   left_ad.last_error().c_str());
+      return 1;
+    }
+    std::printf("opened left %s; USB2CAN CAN baud %u bps\n", opt.left_port.c_str(),
+                left_ad.can_bitrate());
+    if (!right_ad.open())
+    {
+      std::fprintf(stderr,
+                   "open right %s failed: %s\n"
+                   "p3_dual_knee_spin --set-zero needs BOTH buses.\n",
+                   opt.right_port.c_str(), right_ad.last_error().c_str());
+      left_ad.close();
+      return 1;
+    }
+    std::printf("opened right %s; USB2CAN CAN baud %u bps\n", opt.right_port.c_str(),
+                right_ad.can_bitrate());
+    if (opt.handshake)
+    {
+      left_ad.handshake();
+      usleep(20000);
+      left_ad.drain();
+      right_ad.handshake();
+      usleep(20000);
+      right_ad.drain();
+      std::printf("handshake sent (CMD 0x02)\n");
+    }
+    const bool ok_l = biped_hw::dm_send_set_zero(left_ad, opt.left_id);
+    std::printf("set-zero id=%u %s (0xFE) data=FF FF FF FF FF FF FF FE\n",
+                static_cast<unsigned>(opt.left_id), ok_l ? "sent" : "TX FAIL");
+    const bool ok_r = biped_hw::dm_send_set_zero(right_ad, opt.right_id);
+    std::printf("set-zero id=%u %s (0xFE) data=FF FF FF FF FF FF FF FE\n",
+                static_cast<unsigned>(opt.right_id), ok_r ? "sent" : "TX FAIL");
+    if (ok_l)
+    {
+      biped_hw::dm_send_disable(left_ad, opt.left_id);
+      std::printf("disable id=%u sent (0xFD)\n", static_cast<unsigned>(opt.left_id));
+    }
+    if (ok_r)
+    {
+      biped_hw::dm_send_disable(right_ad, opt.right_id);
+      std::printf("disable id=%u sent (0xFD)\n", static_cast<unsigned>(opt.right_id));
+    }
+    left_ad.close();
+    right_ad.close();
+    return (ok_l && ok_r) ? 0 : 1;
   }
 
   const float abort_q = opt.stroke + opt.abort_q_margin;
@@ -1072,7 +785,7 @@ int main(int argc, char **argv)
     std::fprintf(stderr,
                  "open right %s failed: %s\n"
                  "p3_dual_knee_spin needs BOTH buses (left ttyACM0 + right ttyACM1).\n"
-                 "Use p3_left6_sync / p2_dm_mit_ladder for left-only.\n",
+                 "Use p2_dm_mit_ladder for left-only.\n",
                  opt.right_port.c_str(), right_ad.last_error().c_str());
     g_left = nullptr;
     return 1;
@@ -1081,6 +794,7 @@ int main(int argc, char **argv)
               opt.right_port.c_str(), right_ad.can_bitrate(),
               static_cast<unsigned>(right_ad.can_baud_index()));
   g_right = &right_ad;
+  biped_hw::safety_bind_buses(&left_ad, &right_ad);
 
   if (opt.handshake)
   {
@@ -1156,27 +870,6 @@ int main(int argc, char **argv)
     mark(tick.right);
   };
 
-  std::printf(
-      "=== right-probe ACM1 raw RX (paste these) ===\n"
-      "right-probe: TX MIT inquiry kp=0 to CAN %u on RIGHT adapter only (no enable)\n"
-      "判读: can=0x2 且 D[0]esc=%u → 电机是 %u，demux 应收；"
-      "can=%u → 从站 ID 回包；can=0x2 esc=6 → 仍是 ID 6；无帧 → 线/电/波特率。\n",
-      static_cast<unsigned>(opt.right_id), static_cast<unsigned>(opt.right_id),
-      static_cast<unsigned>(opt.right_id), static_cast<unsigned>(opt.right_id));
-  const int right_raw =
-      probe_adapter_raw(right_ad, knees[1], kRightProbeTicks, kRightProbeWaitMs, "right-probe",
-                        true);
-  std::printf("right-probe: raw_rx=%d present=%s", right_raw, knees[1].present ? "ok" : "MISSING");
-  if (knees[1].have_q)
-  {
-    std::printf("(q=%.4f)", static_cast<double>(knees[1].last_q));
-  }
-  std::printf("\n");
-  if (right_raw == 0)
-  {
-    std::printf("right-probe: RX none (0 frames). wiring / power / baud / ACM1 CAN?\n");
-  }
-
   std::printf("probe dual %d ticks drain=%dms (kp=0 inquiry, left id=%u + right id=%u)...\n",
               kProbeTicks, static_cast<int>(probe_drain.count()),
               static_cast<unsigned>(opt.left_id), static_cast<unsigned>(opt.right_id));
@@ -1197,15 +890,11 @@ int main(int argc, char **argv)
     std::printf("(q=%.4f)", static_cast<double>(knees[1].last_q));
   }
   std::printf("\n");
-  if (!knees[1].present)
-  {
-    scan_right_bus(right_ad, knees[1].lim);
-  }
   if (!knees[0].present || !knees[1].present)
   {
     std::fprintf(stderr,
                  "REFUSE: both motors must reply on probe (left CAN %u + right CAN %u).\n"
-                 "把上面 right-probe / right-scan 行贴回来。未使能任何电机。\n",
+                 "未使能任何电机。\n",
                  static_cast<unsigned>(opt.left_id), static_cast<unsigned>(opt.right_id));
     g_left = nullptr;
     g_right = nullptr;
@@ -1237,42 +926,52 @@ int main(int argc, char **argv)
   if (!enable_knee(knees[0], left_ad, left_demux) ||
       !enable_knee(knees[1], right_ad, right_demux))
   {
-    g_disable_n = 0;
-    if (knees[0].enabled)
-    {
-      arm_disable_slot(&left_ad, opt.left_id);
-    }
-    if (knees[1].enabled)
-    {
-      arm_disable_slot(&right_ad, opt.right_id);
-    }
+    biped_hw::safety_set_reason(biped_hw::SafetyReason::RidFail);
     disable_all_now(true);
     g_left = nullptr;
     g_right = nullptr;
+    biped_hw::safety_bind_buses(nullptr, nullptr);
     return 1;
   }
   usleep(kEnableSettleUs);
   left_ad.drain();
   right_ad.drain();
-  g_disable_n = 0;
-  arm_disable_slot(&left_ad, opt.left_id);
-  arm_disable_slot(&right_ad, opt.right_id);
+  biped_hw::safety_arm();
 
-  // q0：使能后 kp=0 再采一次，避免斜坡从绝对 0 猛拉。
-  knees[0].have_q = knees[1].have_q = false;
-  for (int p = 0; p < kProbeTicks && g_run.load(); ++p)
+  const float home_vel =
+      std::min(biped_hw::kDmHomeVelMax, std::max(opt.vel, biped_hw::kDmHomeVel));
+  auto home_one = [&](Knee &k, biped_hw::UsbCanAdapter &ad,
+                      biped_hw::FrameDemux &dm) -> bool {
+    biped_hw::DmHomeStatus hs{};
+    const auto hr = biped_hw::dm_home_to_zero(ad, dm, k.can_id, k.lim, opt.abort_tau,
+                                              biped_hw::kDmHomeTimeoutS,
+                                              biped_hw::kDmHomeEpsRad, &hs, home_vel, opt.kd);
+    std::printf("home id=%u q_before=%.4f %s q_after=%.4f eps=%.3f tau_peak=%.3f\n",
+                static_cast<unsigned>(k.can_id), static_cast<double>(hs.q_before),
+                biped_hw::dm_home_result_name(hr), static_cast<double>(hs.q_after),
+                static_cast<double>(biped_hw::kDmHomeEpsRad),
+                static_cast<double>(hs.tau_peak));
+    if (!biped_hw::dm_home_ok(hr))
+    {
+      std::fprintf(stderr, "home id=%u FAIL (%s); disable-all 0xFD, no profile\n",
+                   static_cast<unsigned>(k.can_id), biped_hw::dm_home_result_name(hr));
+      return false;
+    }
+    k.q0 = hs.q_after;
+    k.q_des = hs.q_after;
+    k.last_q = hs.q_after;
+    k.have_q = true;
+    return true;
+  };
+  if (!home_one(knees[0], left_ad, left_demux) ||
+      !home_one(knees[1], right_ad, right_demux))
   {
-    apply_fb(tick_pair(0.f, 0.f, true, probe_drain), true);
-  }
-  if (!knees[0].have_q || !knees[1].have_q)
-  {
-    std::fprintf(stderr, "no q0 after enable; aborting\n");
     disable_all_now(true);
     g_left = nullptr;
     g_right = nullptr;
     return 1;
   }
-  std::printf("q0 id%u=%.4f  id%u=%.4f  (probe kp=0 after enable)\n",
+  std::printf("q0 id%u=%.4f  id%u=%.4f  (after home-to-zero)\n",
               static_cast<unsigned>(knees[0].can_id), static_cast<double>(knees[0].q0),
               static_cast<unsigned>(knees[1].can_id), static_cast<double>(knees[1].q0));
 
@@ -1403,6 +1102,7 @@ int main(int argc, char **argv)
         std::fprintf(stderr, "ABORT id=%u: |tau_fb|=%.3f > %.3f Nm\n",
                      static_cast<unsigned>(k.can_id), static_cast<double>(std::fabs(k.last_tau)),
                      static_cast<double>(opt.abort_tau));
+        biped_hw::safety_set_reason(biped_hw::SafetyReason::HardLimitTau);
         aborted = true;
       }
       if (opt.stage_dq && std::fabs(k.last_q - k.q0) >= opt.stroke)
@@ -1419,6 +1119,7 @@ int main(int argc, char **argv)
                      static_cast<unsigned>(k.can_id),
                      static_cast<double>(std::fabs(k.last_q - k.q0)),
                      static_cast<double>(abort_q));
+        biped_hw::safety_set_reason(biped_hw::SafetyReason::HardLimitQ);
         aborted = true;
       }
     }
@@ -1474,6 +1175,7 @@ int main(int argc, char **argv)
   disable_all_now(true);
   g_left = nullptr;
   g_right = nullptr;
+  biped_hw::safety_bind_buses(nullptr, nullptr);
   left_ad.close();
   right_ad.close();
 
@@ -1488,4 +1190,32 @@ int main(int argc, char **argv)
     }
   }
   return rc;
+}
+
+}  // namespace
+
+int main(int argc, char **argv)
+{
+  Options opt;
+  std::string err;
+  if (!parse_args(argc, argv, opt, err))
+  {
+    if (err == "help")
+    {
+      return 0;
+    }
+    std::fprintf(stderr, "%s\n", err.c_str());
+    return 2;
+  }
+  if (!biped_hw::dm_codec_self_check() || !biped_hw::bus_cycle_self_check())
+  {
+    std::fprintf(stderr, "codec/bus_cycle self-check failed\n");
+    return 1;
+  }
+  if (opt.self_test)
+  {
+    std::printf("p3_dual_knee_spin self-check OK (no hardware): dm_codec, bus_cycle\n");
+    return 0;
+  }
+  return run(opt);
 }

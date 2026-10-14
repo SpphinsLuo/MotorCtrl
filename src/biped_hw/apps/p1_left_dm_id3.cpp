@@ -1,8 +1,9 @@
-// biped_hw — p1_left_dm_id3.cpp
-// P1 第一关：单电机使能/失能与 RID 限幅读取。同源编成 p1_left_dm_id6（左膝 CAN 6）
-// 与 p1_left_dm_id3（髋偏航 CAN 3）。不发闭环 MIT。
+// 达妙电机通信测试程序
+// P1 第一关：单电机使能/失能与 RID 限幅读取。同源编成 p1_left_dm_id6（左膝 CAN 6）与 p1_left_dm_id3（髋偏航 CAN 3）。
+#include "biped_hw/cli.hpp"
 #include "biped_hw/cycle_logger.hpp"
 #include "biped_hw/dm_codec.hpp"
+#include "biped_hw/dm_mit_host.hpp"
 #include "biped_hw/frame_demux.hpp"
 #include "biped_hw/motor_map.hpp"
 #include "biped_hw/usb_can_adapter.hpp"
@@ -29,94 +30,40 @@
 namespace
 {
 
-// Built as p1_left_dm_id6 (primary, left knee DM10422 CAN 6) and
-// p1_left_dm_id3 (left hip yaw DM10010L CAN 3). --can-id remains overridable.
+// Built as p1_left_dm_id6 (primary, left knee DM10422 CAN 6) and p1_left_dm_id3 (left hip yaw DM10010L CAN 3). --can-id remains overridable.
 constexpr uint8_t kDefaultEscId = static_cast<uint8_t>(P1_DEFAULT_CAN_ID);
 constexpr int kEnableSettleUs = 100000;
 constexpr int kDisableGapUs = 10000;
 
-std::atomic<bool> g_run{true};
+std::atomic<bool> g_run{true};//程序运行标志位
 std::atomic<uint8_t> g_esc_id{kDefaultEscId};
 biped_hw::UsbCanAdapter *g_exit_adapter = nullptr;
 
+//程序退出时的信号处理函数  
 void on_signal(int)
 {
   g_run.store(false);
 }
 
+//在程序退出时，自动发送失能命令给电机
 void atexit_disable()
 {
   if (g_exit_adapter == nullptr || !g_exit_adapter->is_open())
   {
     return;
   }
-  uint8_t buf[8] = {};
-  biped_hw::pack_disable(buf);
-  const uint8_t id = g_esc_id.load();
-  g_exit_adapter->sendCan(id, buf, 8);
-  usleep(kDisableGapUs);
-  g_exit_adapter->sendCan(id, buf, 8);
-}
-
-std::string trim_copy(std::string s)
-{
-  const auto a = s.find_first_not_of(" \t\r\n");
-  if (a == std::string::npos)
-  {
-    return {};
-  }
-  const auto b = s.find_last_not_of(" \t\r\n");
-  return s.substr(a, b - a + 1);
+  biped_hw::dm_send_disable(*g_exit_adapter, g_esc_id.load());
 }
 
 std::string left_port_from_yaml(const std::string &path)
 {
-  std::ifstream in(path);
-  if (!in)
+  std::string left;
+  std::string right;
+  if (!biped_hw::yaml_bus_ports(path, &left, &right))
   {
     return {};
   }
-  std::string line;
-  bool in_left = false;
-  while (std::getline(in, line))
-  {
-    const auto hash = line.find('#');
-    if (hash != std::string::npos)
-    {
-      line = line.substr(0, hash);
-    }
-    const std::string t = trim_copy(line);
-    if (t.empty())
-    {
-      continue;
-    }
-    if (t.find("right:") == 0)
-    {
-      in_left = false;
-      continue;
-    }
-    if (t.find("left:") == 0)
-    {
-      in_left = true;
-      continue;
-    }
-    if (!in_left)
-    {
-      continue;
-    }
-    const auto p = t.find("port:");
-    if (p == 0)
-    {
-      return trim_copy(t.substr(5));
-    }
-  }
-  return {};
-}
-
-bool is_damiao_mit(biped_hw::MotorType type)
-{
-  return type == biped_hw::MotorType::DM10010L || type == biped_hw::MotorType::DM10010 ||
-         type == biped_hw::MotorType::DM10422;
+  return left;
 }
 
 bool needs_live_limits(biped_hw::MotorType type)
@@ -154,8 +101,8 @@ void usage()
       "Primary P1 gate: p1_left_dm_id6 = left knee DM10422 CAN 6, Master 2.\n"
       "Hip yaw stay-behind: p1_left_dm_id3 = left DM10010L CAN 3 (--can-id 3).\n"
       "Replies on Master CAN ID 2; demux by ESC_ID nibble (not RX canId).\n"
-      "DM10422 has no official pack table — RID 21/22/23 is required before enable,\n"
-      "or pass --force-limits (never guess 400 Nm / never reuse 10010L TMAX=200).\n"
+      "DM10422 table default is {12.5, 20, 400}; RID 21/22/23 overrides when read.\n"
+      "Knee enable still requires RID 21/22/23, or pass --force-limits.\n"
       "Low-kp MIT hold, tau=0. Knee default kp=1. Motor may twitch. Disable on exit.\n"
       "Never opens the right adapter. Never commands Motorevo ID 8.\n",
       P1_BIN_NAME, static_cast<unsigned>(kDefaultEscId));
@@ -180,11 +127,7 @@ struct DisableGuard
     {
       return;
     }
-    uint8_t buf[8] = {};
-    biped_hw::pack_disable(buf);
-    adapter->sendCan(can_id, buf, 8);
-    usleep(kDisableGapUs);
-    adapter->sendCan(can_id, buf, 8);
+    biped_hw::dm_send_disable(*adapter, can_id);
     usleep(kDisableGapUs);
     std::printf("disable id=%u sent (0xFD)\n", static_cast<unsigned>(can_id));
     armed = false;
@@ -193,57 +136,16 @@ struct DisableGuard
   ~DisableGuard() { disable_now(); }
 };
 
-bool read_one_rid(biped_hw::UsbCanAdapter &adapter, biped_hw::FrameDemux &demux,
-                  uint8_t esc_id, uint8_t rid, float &value)
-{
-  uint8_t buf[8] = {};
-  biped_hw::pack_register_read(buf, esc_id, rid);
-  if (!adapter.sendCan(biped_hw::kDmRegCanId, buf, 8))
-  {
-    return false;
-  }
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
-  while (std::chrono::steady_clock::now() < deadline)
-  {
-    biped_hw::CanRxFrame rx;
-    if (adapter.pollCan(rx))
-    {
-      demux.push(rx);
-    }
-    biped_hw::DmRegisterReply reply{};
-    if (demux.take_register(esc_id, rid, reply))
-    {
-      value = reply.f;
-      return true;
-    }
-  }
-  return false;
-}
-
-bool read_rid_retries(biped_hw::UsbCanAdapter &adapter, biped_hw::FrameDemux &demux,
-                      uint8_t esc_id, uint8_t rid, float &value)
-{
-  for (int i = 0; i < 3; ++i)
-  {
-    if (read_one_rid(adapter, demux, esc_id, rid, value))
-    {
-      return true;
-    }
-  }
-  return false;
-}
-
 }  // namespace
 
 int main(int argc, char **argv)
 {
-  double duration_s = 8.0;
+  double duration_s = 8.0;//运行时间
   float kp = 0.f;
   float kd = 0.f;
   bool kp_set = false;
   bool kd_set = false;
-  int period_ms = 10;
+  int period_ms = 10;//通信周期/100Hz
   uint8_t esc_id = kDefaultEscId;
   std::string port = biped_hw::kDefaultPortLeft;
   std::string yaml_path;
@@ -255,6 +157,7 @@ int main(int argc, char **argv)
   bool have_force_limits = false;
   biped_hw::LimitParam force_lim{};
 
+  // ---------------------------------Parse command-line arguments---------------------------------
   for (int i = 1; i < argc; ++i)
   {
     auto need = [&](const char *flag) -> const char * {
@@ -355,7 +258,7 @@ int main(int argc, char **argv)
       if (!parse_force_limits(v, force_lim))
       {
         std::fprintf(stderr,
-                     "--force-limits needs PMAX,VMAX,TMAX (all > 0.1, no guessed 400 Nm)\n");
+                     "--force-limits needs PMAX,VMAX,TMAX (all > 0.1)\n");
         return 2;
       }
       have_force_limits = true;
@@ -379,7 +282,9 @@ int main(int argc, char **argv)
       return 2;
     }
   }
+  // ----------------------------------------------------------------------------------------------
 
+  // ---------------------------------系统状态检测及阈值保护-----------------------------------------
   if (!biped_hw::dm_codec_self_check())
   {
     std::fprintf(stderr, "dm_codec self-check failed\n");
@@ -393,7 +298,7 @@ int main(int argc, char **argv)
 
   const auto *entry = biped_hw::find_by_can_id(esc_id);
   if (entry == nullptr || entry->bus != biped_hw::BusId::Left ||
-      entry->master_id != biped_hw::kMasterId || !is_damiao_mit(entry->model))
+      entry->master_id != biped_hw::kMasterId || !biped_hw::is_damiao_mit(entry->model))
   {
     std::fprintf(stderr,
                  "motor map mismatch for CAN ID %u (need left-bus Damiao MIT, Master 2)\n",
@@ -470,8 +375,8 @@ int main(int argc, char **argv)
       static_cast<unsigned>(biped_hw::kMasterId), static_cast<unsigned>(esc_id),
       static_cast<double>(kp), static_cast<double>(kd), duration_s, period_ms);
 
-  std::signal(SIGINT, on_signal);
-  std::signal(SIGTERM, on_signal);
+  std::signal(SIGINT, on_signal);//ctrl+c退出
+  std::signal(SIGTERM, on_signal);//系统或其他程序请求进程正常终止
 
   biped_hw::UsbCanAdapter adapter(port);
   if (!adapter.open())
@@ -501,6 +406,7 @@ int main(int argc, char **argv)
     adapter.drain();
     std::printf("handshake sent (CMD 0x02)\n");
   }
+  // ----------------------------------------------------------------------------------------------
 
   biped_hw::LimitParam lim{};
   const char *lim_src = "unset";
@@ -508,14 +414,15 @@ int main(int argc, char **argv)
 
   float pmax = 0.f, vmax = 0.f, tmax = 0.f;
   bool pok = false, vok = false, tok = false;
+  // ---------------------------------读取电机限幅参数---------------------------------------------
   if (knee || read_limits)
   {
     adapter.drain();
-    pok = read_rid_retries(adapter, demux, esc_id,
+    pok = biped_hw::dm_read_rid(adapter, demux, esc_id,
                            static_cast<uint8_t>(biped_hw::DmRid::Pmax), pmax);
-    vok = read_rid_retries(adapter, demux, esc_id,
+    vok = biped_hw::dm_read_rid(adapter, demux, esc_id,
                            static_cast<uint8_t>(biped_hw::DmRid::Vmax), vmax);
-    tok = read_rid_retries(adapter, demux, esc_id,
+    tok = biped_hw::dm_read_rid(adapter, demux, esc_id,
                            static_cast<uint8_t>(biped_hw::DmRid::Tmax), tmax);
     std::printf("RID 21/22/23 PMAX=%s%.4f VMAX=%s%.4f TMAX=%s%.4f\n", pok ? "" : "FAIL ",
                 static_cast<double>(pmax), vok ? "" : "FAIL ",
@@ -543,7 +450,7 @@ int main(int argc, char **argv)
     std::fprintf(stderr,
                  "REFUSE enable: knee DM10422 CAN %u limits UNVERIFIED and RID 21/22/23 "
                  "read failed.\n"
-                 "Do not pack MIT with DM10010L {12.5,25,200} or a guessed 400 Nm TMAX.\n"
+                 "Do not pack MIT with DM10010 {12.5,20,200}; table default is {12.5,20,400}.\n"
                  "Retry on a live bus, or pass --force-limits PMAX,VMAX,TMAX from the motor.\n",
                  static_cast<unsigned>(esc_id));
     return 1;
@@ -575,8 +482,7 @@ int main(int argc, char **argv)
               static_cast<double>(lim.tau_max), lim_src);
 
   uint8_t cmd[8] = {};
-  biped_hw::pack_enable(cmd);
-  if (!adapter.sendCan(esc_id, cmd, 8))
+  if (!biped_hw::dm_send_enable(adapter, esc_id))
   {
     std::fprintf(stderr, "enable send failed\n");
     return 1;
@@ -584,6 +490,7 @@ int main(int argc, char **argv)
   std::printf("enable id=%u sent (0xFC)\n", static_cast<unsigned>(esc_id));
   usleep(kEnableSettleUs);
   adapter.drain();
+  // ----------------------------------------------------------------------------------------------
 
   biped_hw::CycleLogger log;
   float q_hold = 0.f;
@@ -595,13 +502,13 @@ int main(int argc, char **argv)
   std::uint64_t printed = 0;
   auto last_print = t0;
 
+  // ---------------------------------主循环---------------------------------------------
   while (g_run.load() && (biped_hw::CycleLogger::Clock::now() - t0) < duration)
   {
     next += period;
     const float q_cmd = have_q ? q_hold : 0.f;
     biped_hw::pack_mit(cmd, kp, kd, q_cmd, 0.f, 0.f, lim);
-    const auto t_send = biped_hw::CycleLogger::Clock::now();
-    if (!adapter.sendCan(esc_id, cmd, 8))
+    const auto t_send = biped_hw::CycleLogger::Clock::now(); 
     {
       std::fprintf(stderr, "MIT send failed; disabling\n");
       break;

@@ -51,6 +51,7 @@ struct MotorFeedback
   uint8_t t_coil = 0;
   SteadyNs t_rx_ns = 0;
   double rx_age_ms = 0.0;
+  bool stale = false;
 };
 
 // One joint encoder slot. Index matches kMbsEncoderMap. Hip yaw / ankle
@@ -137,12 +138,15 @@ inline void overlay_mbs_map(RobotState &st, const MbsEncoderConfig &cfg)
   }
 }
 
+inline constexpr double kMotorStaleMs = 50.0;
+
 inline void stamp_cycle(RobotState &st, SteadyNs t_cycle)
 {
   st.t_cycle_ns = t_cycle;
   for (auto &m : st.motors)
   {
     m.rx_age_ms = m.valid ? age_ms(m.t_rx_ns, t_cycle) : 0.0;
+    m.stale = m.valid && m.rx_age_ms > kMotorStaleMs;
   }
   for (auto &e : st.mbs)
   {
@@ -343,7 +347,7 @@ inline int robot_state_self_test()
   }
 
   stamp_cycle(st, t_rx + 5'000'000);
-  if (st.motors[3].rx_age_ms < 4.9 || st.motors[3].rx_age_ms > 5.1)
+  if (st.motors[3].rx_age_ms < 4.9 || st.motors[3].rx_age_ms > 5.1 || st.motors[3].stale)
   {
     return 7;
   }

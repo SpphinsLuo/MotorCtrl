@@ -1,14 +1,16 @@
-// biped_hw — p2_evo_servo_track.cpp
-// P2 单电机 Motorevo 伺服跟踪。默认 CAN ID / 串口不变（左踝 Roll HA60 CAN 8 /
+// 泉智博电机闭环测试程序
+// P2 单电机 Motorevo 伺服跟踪。默认 CAN ID / 串口不变（左踝 Roll HA60 CAN 8 ）
 // ACM0）。--can-id 接受 map 内任意 HA60（Master 2）；--port 覆盖串口，不按
-// map 切总线。达妙电机用 p2_dm_mit_ladder。
 // 官方伺服是位置+速度级联（指南 V3.5 §6.3.1）：θ_ref 为 rad，Byte2 是过渡转速上限
 // V_ref（rad/s），Byte5 是速度环 Kp。V_ref=0 或 vel_kp=0 时电机不会走向 q_des。
 // 位置档：使能后先取 q0，再小阶跃 q0±pos_amp 后回 q0。实验室 HA60 常停在
 // ≈+5 rad（软限位/机械顶死）；此时 +pos_amp 无法动，默认 q0-pos_amp 朝 0。
 // --pos-sign +1|-1 可覆盖。速度档是位置斜坡 q_des += vel*dt，|q_des-q0|
-// 限幅 --vel-stroke。退出 / SIGINT 发 0xFD。指令必须绕 q0，禁止朝绝对 0 拉。
+// 限幅 --vel-stroke。退出 / SIGINT 发 0xFD。使能后先测 |q|，偏离零则伺服回零，
+// 再绕测得的 q0 发指令。
+#include "biped_hw/cli.hpp"
 #include "biped_hw/cycle_logger.hpp"
+#include "biped_hw/dm_mit_host.hpp"
 #include "biped_hw/frame_demux.hpp"
 #include "biped_hw/metrics.hpp"
 #include "biped_hw/motor_map.hpp"
@@ -43,7 +45,7 @@ constexpr float kPosKdCap = 2.f;
 constexpr float kDefaultVelKp = 20.f;    // 指南例 50；踝滚仍保守，5 偏弱
 constexpr float kDefaultVelKd = 0.f;
 constexpr float kDefaultVelKi = 0.001f;  // 指南伺服例
-constexpr float kVelKpCap = 50.f;        // 允许对齐官方例 50
+constexpr float kVelKpCap = 50.f;        
 constexpr float kVelKdCap = 2.f;
 constexpr float kDefaultVelLimit = 0.5f;  // rad/s 过渡上限；指南例 2.0，踝滚放慢
 constexpr float kVelLimitCap = 2.f;
@@ -221,6 +223,7 @@ struct StageResult
   std::size_t rx_on_master = 0;
 };
 
+//程序退出时的信号处理函数  
 void on_signal(int)
 {
   g_run.store(false);
@@ -239,59 +242,15 @@ void atexit_disable()
   g_exit_adapter->sendCan(g_esc_id.load(), buf, 8);
 }
 
-std::string trim_copy(std::string s)
-{
-  const auto a = s.find_first_not_of(" \t\r\n");
-  if (a == std::string::npos)
-  {
-    return {};
-  }
-  const auto b = s.find_last_not_of(" \t\r\n");
-  return s.substr(a, b - a + 1);
-}
-
 std::string left_port_from_yaml(const std::string &path)
 {
-  std::ifstream in(path);
-  if (!in)
+  std::string left;
+  std::string right;
+  if (!biped_hw::yaml_bus_ports(path, &left, &right))
   {
     return {};
   }
-  std::string line;
-  bool in_left = false;
-  while (std::getline(in, line))
-  {
-    const auto hash = line.find('#');
-    if (hash != std::string::npos)
-    {
-      line = line.substr(0, hash);
-    }
-    const std::string t = trim_copy(line);
-    if (t.empty())
-    {
-      continue;
-    }
-    if (t.find("right:") == 0)
-    {
-      in_left = false;
-      continue;
-    }
-    if (t.find("left:") == 0)
-    {
-      in_left = true;
-      continue;
-    }
-    if (!in_left)
-    {
-      continue;
-    }
-    const auto p = t.find("port:");
-    if (p == 0)
-    {
-      return trim_copy(t.substr(5));
-    }
-  }
-  return {};
+  return left;
 }
 
 bool is_motorevo(biped_hw::MotorType type)
@@ -308,6 +267,12 @@ void usage()
       "  --can-id N            default %u; mapped Motorevo HA60, Master 2 (any bus)\n"
       "  --period-ms MS        control period (default 10 = 100 Hz)\n"
       "  --stage pos|vel|all   default pos (no torque/current stage on HA60)\n"
+      "                        Before --stage: probe |q|; if |q|>%.3f rad\n"
+      "                        (kDmHomeEpsRad), speed-limited servo return to 0\n"
+      "                        (θ_ref=0, V_ref=%.1f rad/s) until |q|<=eps, timeout\n"
+      "                        max(%.0f, |q|/min(vel,%.0f)+%.0f) cap %.0f s, or abort-tau.\n"
+      "                        Then the stage. Fail → 0xFD, no profile. Not\n"
+      "                        --set-zero / --self-test. Not 0xFE (firmware zero).\n"
       "  --pos-amp RAD         position step magnitude (default 0.05 ~3 deg)\n"
       "  --pos-sign +1|-1      step q0±pos_amp (default -1 if q0>1 or near +5 stop)\n"
       "  --vel-amp RAD/S       vel-stage ramp rate (default 0.15)\n"
@@ -323,12 +288,22 @@ void usage()
       "  --self-test           codec + metrics + demux, no hardware\n"
       "  --verbose             denser cycle log\n"
       "  --print-tx            hex dump servo TX (first + q_des edges always printed)\n"
-      "  Commands are around measured q0 (~5 rad), never absolute 0.\n"
-      "  Official servo: θ_ref rad, V_ref=max speed rad/s, vel_kp>0. Disable 0xFD.\n"
+      "  --set-zero            WRITES firmware zero (current pos → motor zero),\n"
+      "                        HA60 V1 MIT 0xFE. Does not run --stage motion.\n"
+      "                        Mutually exclusive with --stage. Requires explicit\n"
+      "                        --can-id and --port. No 0xFC; then 0xFD hygiene.\n"
+      "  After home, commands are around measured q0. Disable 0xFD.\n"
+      "  Official servo: θ_ref rad, V_ref=max speed rad/s, vel_kp>0.\n"
       "  Single-motor bring-up. Port is --port / ACM0, not the map bus.\n"
       "  Never commands Damiao MIT motors.\n"
       "  Session log: /tmp/biped_hw_p2_evo_last.log and data/p2_evo_servo_track_<ts>.log\n",
-      static_cast<unsigned>(kEscId));
+      static_cast<unsigned>(kEscId),
+      static_cast<double>(biped_hw::kDmHomeEpsRad),
+      static_cast<double>(biped_hw::kEvoHomeVelLimit),
+      static_cast<double>(biped_hw::kDmHomeTimeoutS),
+      static_cast<double>(biped_hw::kDmHomeVel),
+      static_cast<double>(biped_hw::kDmHomeTimeoutSlackS),
+      static_cast<double>(biped_hw::kDmHomeTimeoutMaxS));
 }
 
 struct DisableGuard
@@ -1044,6 +1019,9 @@ int main(int argc, char **argv)
   bool verbose = false;
   bool print_tx = false;
   bool port_set = false;
+  bool can_id_set = false;
+  bool stage_set = false;
+  bool set_zero = false;
 
   bool do_pos = true;
   bool do_vel = false;
@@ -1067,6 +1045,7 @@ int main(int argc, char **argv)
   float q0 = 0.f;
   bool have_q0 = false;
 
+  // ---------------------------------Parse command-line arguments---------------------------
   for (int i = 1; i < argc; ++i)
   {
     auto need = [&](const char *flag) -> const char * {
@@ -1100,6 +1079,7 @@ int main(int argc, char **argv)
         return 2;
       }
       esc_id = static_cast<uint8_t>(id);
+      can_id_set = true;
     }
     else if (std::strcmp(argv[i], "--port") == 0)
     {
@@ -1128,6 +1108,7 @@ int main(int argc, char **argv)
         std::fprintf(stderr, "--stage must be pos|vel|all (no torque on HA60)\n");
         return 2;
       }
+      stage_set = true;
     }
     else if (std::strcmp(argv[i], "--pos-amp") == 0)
     {
@@ -1277,6 +1258,10 @@ int main(int argc, char **argv)
     {
       print_tx = true;
     }
+    else if (std::strcmp(argv[i], "--set-zero") == 0)
+    {
+      set_zero = true;
+    }
     else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0)
     {
       usage();
@@ -1289,6 +1274,18 @@ int main(int argc, char **argv)
     }
   }
 
+  if (set_zero && stage_set)
+  {
+    std::fprintf(stderr, "refuse: --set-zero cannot be combined with --stage\n");
+    return 2;
+  }
+  if (set_zero && (!can_id_set || !port_set))
+  {
+    std::fprintf(stderr, "--set-zero requires --can-id and --port\n");
+    return 2;
+  }
+
+  // ---------------------------------Initialize session log---------------------------------
   SessionLogGuard slog_guard;
   if (!g_slog.open())
   {
@@ -1525,6 +1522,31 @@ int main(int argc, char **argv)
     g_slog.out("handshake sent (CMD 0x02)\n");
   }
 
+  if (set_zero)
+  {
+    g_slog.out(
+        "WARN: --set-zero WRITES firmware zero at current shaft position "
+        "(HA60 V1 0xFE). Irreversible-ish. Shaft must be at intended origin. No 0xFC.\n");
+    uint8_t z[8] = {};
+    biped_hw::pack_motorevo_set_zero(z);
+    if (!adapter.sendCan(esc_id, z, 8))
+    {
+      g_slog.err("set-zero send failed\n");
+      print_end_banner(q0, have_q0, pos_amp, pos_sign, pos_kp, vel_kp, results);
+      guard.disable_now();
+      g_exit_adapter = nullptr;
+      adapter.close();
+      return 1;
+    }
+    usleep(kDisableGapUs);
+    g_slog.out("set-zero id=%u sent (V1 0xFE) data=FF FF FF FF FF FF FF FE\n",
+               static_cast<unsigned>(esc_id));
+    guard.disable_now();
+    g_exit_adapter = nullptr;
+    adapter.close();
+    return 0;
+  }
+
   adapter.drain();
   uint8_t cmd[8] = {};
   biped_hw::pack_motorevo_enable(cmd);
@@ -1538,42 +1560,26 @@ int main(int argc, char **argv)
   usleep(kEnableSettleUs);
   adapter.drain();
 
-  // Probe q0 with kp=kd=0 so servo does not yank toward absolute 0 (q0~5 rad).
+  // Probe |q|; home to 0 if off zero (servo θ_ref=0). Not 0xFE.
   biped_hw::FrameDemux demux;
-  const auto q0_deadline =
-      std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-  bool printed_q0_tx = false;
-  while (!have_q0 && std::chrono::steady_clock::now() < q0_deadline)
+  biped_hw::DmHomeStatus hs{};
+  const auto hr = biped_hw::evo_home_to_zero(adapter, demux, esc_id, abort_tau,
+                                             biped_hw::kDmHomeTimeoutS,
+                                             biped_hw::kDmHomeEpsRad, &hs);
+  if (hr != biped_hw::DmHomeResult::ProbeFail)
   {
-    biped_hw::pack_motorevo_servo(cmd, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f);
-    if (print_tx && !printed_q0_tx)
-    {
-      print_servo_tx(esc_id, cmd, 0.f, 0.f, 0.f, 0.f, 0.f, /*console=*/true);
-      printed_q0_tx = true;
-    }
-    adapter.sendCan(esc_id, cmd, 8);
-    usleep(static_cast<useconds_t>(period_ms * 1000));
-    biped_hw::CanRxFrame rx;
-    while (adapter.pollCan(rx))
-    {
-      demux.push(rx);
-      biped_hw::MotorevoFeedback fb{};
-      if (demux.take_motorevo(esc_id, fb))
-      {
-        q0 = fb.q;
-        have_q0 = true;
-        g_slog.out("q0=%.4f rad (probe kp=0)  status=%u(%s) err=%u rx_id=%u\n",
-                   static_cast<double>(q0), static_cast<unsigned>(fb.status),
-                   biped_hw::motorevo_status_name(fb.status),
-                   static_cast<unsigned>(fb.err_code), fb.rx_can_id);
-        break;
-      }
-    }
+    q0 = hs.q_after;
+    have_q0 = true;
   }
-  if (!have_q0)
+  g_slog.out("home id=%u q_before=%.4f %s q_after=%.4f eps=%.3f tau_peak=%.3f\n",
+             static_cast<unsigned>(esc_id), static_cast<double>(hs.q_before),
+             biped_hw::dm_home_result_name(hr), static_cast<double>(hs.q_after),
+             static_cast<double>(biped_hw::kDmHomeEpsRad),
+             static_cast<double>(hs.tau_peak));
+  if (!biped_hw::dm_home_ok(hr))
   {
-    g_slog.err("no Motorevo feedback for q0 on slave %u or Master 2; aborting\n",
-               static_cast<unsigned>(esc_id));
+    g_slog.err("home FAIL (%s); 0xFD, not starting stage\n",
+               biped_hw::dm_home_result_name(hr));
     print_end_banner(q0, have_q0, pos_amp, pos_sign, pos_kp, vel_kp, results);
     guard.disable_now();
     g_exit_adapter = nullptr;

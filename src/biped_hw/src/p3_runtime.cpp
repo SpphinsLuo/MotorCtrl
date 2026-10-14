@@ -1,20 +1,27 @@
 // biped_hw — p3_runtime.cpp
-// P3 运行时：探测在线 ID、低 kp hold、write-all/drain-all，缺电机超时记表。
-// 默认只使能 --ids（通常为 6）；--ids 含 HA60 时纳入伺服 hold。P5 才做通信丢失 disable-all。
+// P3 运行时：探测在线 ID、低 kp hold 或 triangle 绕 q0、write-all/drain-all。
+// 默认只使能 --ids（通常为 6）；--ids 含 HA60 时纳入伺服。退出走 P5 disable-all。
+// --comms-only 不发 0xFC：RID + MIT kp=0 / HA60 evo inquire，然后 0xFD。
+// --stage triangle 不调用 dm_home_to_zero：q_des 在探测 q0±stroke 反向。
+// --set-zero：选中 --ids 写固件零点（0xFE），不发 0xFC，不与 --stage 并用，然后 0xFD。
 #include "biped_hw/p3_runtime.hpp"
 
 #include "biped_hw/bus_cycle.hpp"
+#include "biped_hw/cli.hpp"
 #include "biped_hw/cycle_logger.hpp"
 #include "biped_hw/dm_codec.hpp"
+#include "biped_hw/dm_mit_host.hpp"
 #include "biped_hw/frame_demux.hpp"
 #include "biped_hw/metrics.hpp"
 #include "biped_hw/motor_map.hpp"
 #include "biped_hw/motorevo_codec.hpp"
+#include "biped_hw/safety.hpp"
 #include "biped_hw/usb_can_adapter.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -40,21 +47,42 @@ constexpr float kHa60HoldVelLimit = 0.5f;
 constexpr float kHa60HoldVelKp = 20.f;
 constexpr float kHa60HoldVelKd = 0.f;
 constexpr float kHa60HoldVelKi = 0.001f;
+constexpr float kVelDefault = 0.20f;
+constexpr float kVelCap = 0.30f;
+constexpr float kStrokeDefault = 0.349f;  // ±20 deg
+constexpr float kAbortTauDefault = 15.f;
+constexpr float kAbortQMargin = 0.10f;
 
 std::atomic<bool> g_run{true};
 UsbCanAdapter *g_left = nullptr;
 UsbCanAdapter *g_right = nullptr;
-uint8_t g_disable_ids[16] = {};
-std::size_t g_disable_n = 0;
 
 void on_signal(int)
 {
   g_run.store(false);
+  safety_estop_trip();
+}
+
+void disable_all_now(bool print)
+{
+  if (!safety_armed() && !safety_estop_latched() &&
+      safety_last_reason() == SafetyReason::None)
+  {
+    return;
+  }
+  const auto r = safety_estop_latched() ? SafetyReason::Estop : safety_last_reason();
+  safety_disable_all(g_left, g_right, nullptr, 0,
+                     r == SafetyReason::None ? SafetyReason::Estop : r, print);
+}
+
+void atexit_disable()
+{
+  safety_atexit_disable();
 }
 
 bool is_damiao(MotorType t)
 {
-  return t == MotorType::DM10010L || t == MotorType::DM10010 || t == MotorType::DM10422;
+  return is_damiao_mit(t);
 }
 
 bool contains_id(const std::vector<uint8_t> &ids, uint8_t id)
@@ -62,122 +90,6 @@ bool contains_id(const std::vector<uint8_t> &ids, uint8_t id)
   return std::find(ids.begin(), ids.end(), id) != ids.end();
 }
 
-void send_disable(UsbCanAdapter *a, uint8_t id)
-{
-  if (a == nullptr || !a->is_open())
-  {
-    return;
-  }
-  uint8_t buf[8] = {};
-  pack_disable(buf);
-  a->sendCan(id, buf, 8);
-  usleep(kDisableGapUs);
-  a->sendCan(id, buf, 8);
-}
-
-void disable_all_now(bool print)
-{
-  for (std::size_t i = 0; i < g_disable_n; ++i)
-  {
-    const uint8_t id = g_disable_ids[i];
-    const auto *e = find_by_can_id(id);
-    UsbCanAdapter *a = nullptr;
-    if (e != nullptr && e->bus == BusId::Right)
-    {
-      a = g_right;
-    }
-    else
-    {
-      a = g_left;
-    }
-    send_disable(a, id);
-    if (print)
-    {
-      std::printf("disable id=%u sent (0xFD)\n", static_cast<unsigned>(id));
-    }
-  }
-  g_disable_n = 0;
-}
-
-void atexit_disable()
-{
-  disable_all_now(false);
-}
-
-void arm_disable(const std::vector<uint8_t> &ids)
-{
-  g_disable_n = 0;
-  for (uint8_t id : ids)
-  {
-    if (g_disable_n >= 16)
-    {
-      break;
-    }
-    g_disable_ids[g_disable_n++] = id;
-  }
-}
-
-std::string trim_copy(std::string s)
-{
-  const auto a = s.find_first_not_of(" \t\r\n");
-  if (a == std::string::npos)
-  {
-    return {};
-  }
-  const auto b = s.find_last_not_of(" \t\r\n");
-  return s.substr(a, b - a + 1);
-}
-
-bool yaml_ports(const std::string &path, std::string &left, std::string &right)
-{
-  std::ifstream in(path);
-  if (!in)
-  {
-    return false;
-  }
-  std::string line;
-  int section = 0;  // 1 left, 2 right
-  bool got = false;
-  while (std::getline(in, line))
-  {
-    const auto hash = line.find('#');
-    if (hash != std::string::npos)
-    {
-      line = line.substr(0, hash);
-    }
-    const std::string t = trim_copy(line);
-    if (t.empty())
-    {
-      continue;
-    }
-    if (t.find("left:") == 0)
-    {
-      section = 1;
-      continue;
-    }
-    if (t.find("right:") == 0)
-    {
-      section = 2;
-      continue;
-    }
-    if (t.find("port:") != 0)
-    {
-      continue;
-    }
-    const std::string v = trim_copy(t.substr(5));
-    if (section == 1)
-    {
-      left = v;
-      got = true;
-    }
-    else if (section == 2)
-    {
-      right = v;
-      got = true;
-    }
-  }
-  return got;
-}
 
 bool parse_csv_u8(const char *s, std::vector<uint8_t> &out)
 {
@@ -213,15 +125,6 @@ bool parse_csv_u8(const char *s, std::vector<uint8_t> &out)
   return !out.empty();
 }
 
-const char *need_arg(int &i, int argc, char **argv, const char *flag, std::string &err)
-{
-  if (i + 1 >= argc)
-  {
-    err = std::string(flag) + " needs a value";
-    return nullptr;
-  }
-  return argv[++i];
-}
 
 bool parse_bool_flag(const char *v, bool &out)
 {
@@ -253,6 +156,72 @@ UsbCanAdapter *adapter_for(uint8_t can_id)
   return g_left;
 }
 
+bool id12_on_adapter(UsbCanAdapter &ad, float &q0)
+{
+  if (!ad.is_open())
+  {
+    return false;
+  }
+  FrameDemux dm;
+  q0 = 0.f;
+  return dm_probe_q0(ad, dm, 12, kLimitDm10422, q0, 3, 50);
+}
+
+bool open_print_right(UsbCanAdapter &ad, const std::string &path)
+{
+  if (!ad.open())
+  {
+    std::fprintf(stderr, "open right %s failed: %s\n", path.c_str(), ad.last_error().c_str());
+    return false;
+  }
+  std::printf("opened right %s; USB2CAN CAN baud %u bps cmd=55 05 %02X AA 55\n", path.c_str(),
+              ad.can_bitrate(), static_cast<unsigned>(ad.can_baud_index()));
+  return true;
+}
+
+// Right6: prefer --port / ACM1. If that port has no ID12 D[0]=0x0C, use the
+// other ACM when it does. MIT kp=0 only (no 0xFC).
+UsbCanAdapter *open_right6_port(UsbCanAdapter &primary, UsbCanAdapter &alt,
+                                const std::string &primary_path, const std::string &alt_path)
+{
+  float q0 = 0.f;
+  const bool prim_open = open_print_right(primary, primary_path);
+  if (prim_open && id12_on_adapter(primary, q0))
+  {
+    std::printf("identity: ID12 D[0]=0x0C on %s (q=%.4f)\n", primary_path.c_str(),
+                static_cast<double>(q0));
+    primary.drain();
+    return &primary;
+  }
+  if (prim_open)
+  {
+    std::printf("identity: ID12 silent on %s; trying %s\n", primary_path.c_str(),
+                alt_path.c_str());
+    primary.close();
+  }
+  float q0b = 0.f;
+  if (open_print_right(alt, alt_path) && id12_on_adapter(alt, q0b))
+  {
+    std::printf("identity: ID12 D[0]=0x0C on %s (q=%.4f); using this port\n", alt_path.c_str(),
+                static_cast<double>(q0b));
+    alt.drain();
+    return &alt;
+  }
+  if (alt.is_open())
+  {
+    std::printf("identity: ID12 silent on %s too; staying here for the 9-14 probe\n",
+                alt_path.c_str());
+    return &alt;
+  }
+  if (prim_open && open_print_right(primary, primary_path))
+  {
+    std::printf("identity: no ID12 on either ACM; probing requested port %s\n",
+                primary_path.c_str());
+    return &primary;
+  }
+  return nullptr;
+}
+
 FrameDemux *demux_for(uint8_t can_id, FrameDemux &left, FrameDemux &right)
 {
   const auto *e = find_by_can_id(can_id);
@@ -263,71 +232,6 @@ FrameDemux *demux_for(uint8_t can_id, FrameDemux &left, FrameDemux &right)
   return &left;
 }
 
-bool wait_register(UsbCanAdapter &adapter, FrameDemux &demux, uint8_t esc_id, uint8_t rid,
-                   DmRegisterReply &reply, int timeout_ms)
-{
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-  while (std::chrono::steady_clock::now() < deadline)
-  {
-    CanRxFrame rx;
-    if (adapter.pollCan(rx))
-    {
-      demux.push(rx);
-    }
-    if (demux.take_register(esc_id, rid, reply))
-    {
-      return true;
-    }
-  }
-  return false;
-}
-
-bool read_rid_retries(UsbCanAdapter &adapter, FrameDemux &demux, uint8_t esc_id, uint8_t rid,
-                      float &value)
-{
-  for (int i = 0; i < 3; ++i)
-  {
-    demux.clear();
-    uint8_t buf[8] = {};
-    pack_register_read(buf, esc_id, rid);
-    if (!adapter.sendCan(kDmRegCanId, buf, 8))
-    {
-      continue;
-    }
-    DmRegisterReply reply{};
-    if (wait_register(adapter, demux, esc_id, rid, reply, 200))
-    {
-      value = reply.f;
-      return true;
-    }
-  }
-  return false;
-}
-
-bool write_rid_u32_retries(UsbCanAdapter &adapter, FrameDemux &demux, uint8_t esc_id,
-                           uint8_t rid, uint32_t value)
-{
-  for (int i = 0; i < 3; ++i)
-  {
-    demux.clear();
-    uint8_t buf[8] = {};
-    pack_register_write_u32(buf, esc_id, rid, value);
-    if (!adapter.sendCan(kDmRegCanId, buf, 8))
-    {
-      continue;
-    }
-    DmRegisterReply reply{};
-    if (wait_register(adapter, demux, esc_id, rid, reply, 200))
-    {
-      if (reply.u == value || static_cast<uint32_t>(reply.f + 0.5f) == value)
-      {
-        return true;
-      }
-    }
-  }
-  return false;
-}
 
 std::vector<uint8_t> expected_ids(BusId bus, bool skip_motorevo)
 {
@@ -374,9 +278,20 @@ struct IdStats
   double rtt_min = 1e9;
   double rtt_max = 0.0;
   float last_q = 0.f;
+  float last_tau = 0.f;
+  float q0 = 0.f;
+  float q_des = 0.f;
+  float vel_sign = 1.f;
+  float q_min = 0.f;
+  float q_max = 0.f;
+  float q_peak_abs = 0.f;
+  float tau_peak_abs = 0.f;
   bool have_q = false;
+  bool have_q0 = false;
   bool enabled = false;
   bool present_probe = false;
+  std::uint64_t err_n = 0;
+  uint8_t last_err = 0;
 };
 
 IdStats *find_stats(std::vector<IdStats> &st, uint8_t id)
@@ -424,7 +339,34 @@ void accumulate(std::vector<IdStats> &st, const BusCycleResult &r)
       if (m.have_fb)
       {
         s->last_q = m.fb.q;
+        s->last_tau = m.fb.tau;
         s->have_q = true;
+        const float tabs = std::fabs(m.fb.tau);
+        if (tabs > s->tau_peak_abs)
+        {
+          s->tau_peak_abs = tabs;
+        }
+        if (s->have_q0)
+        {
+          if (m.fb.q < s->q_min)
+          {
+            s->q_min = m.fb.q;
+          }
+          if (m.fb.q > s->q_max)
+          {
+            s->q_max = m.fb.q;
+          }
+          const float dev = std::fabs(m.fb.q - s->q0);
+          if (dev > s->q_peak_abs)
+          {
+            s->q_peak_abs = dev;
+          }
+        }
+        if (m.fb.err != 0)
+        {
+          ++s->err_n;
+          s->last_err = m.fb.err;
+        }
       }
     }
     else if (m.drop)
@@ -435,7 +377,8 @@ void accumulate(std::vector<IdStats> &st, const BusCycleResult &r)
 }
 
 void pack_cmd_for(CycleMotorCmd &c, const MotorMapEntry &e, const LimitParam &lim, bool send,
-                  bool expect, bool enabled, float kp, float kd, float q_hold, bool have_q)
+                  bool expect, bool enabled, float kp, float kd, float q_cmd, bool have_q,
+                  float dq, float ha60_vref)
 {
   c = {};
   c.can_id = e.can_id;
@@ -450,20 +393,41 @@ void pack_cmd_for(CycleMotorCmd &c, const MotorMapEntry &e, const LimitParam &li
   }
   if (e.model == MotorType::HA60)
   {
-    const float q = have_q ? q_hold : 0.f;
+    const float q = have_q ? q_cmd : 0.f;
     if (!enabled)
     {
       pack_motorevo_servo(c.data, q, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f);
       return;
     }
-    pack_motorevo_servo(c.data, q, kHa60HoldPosKp, kHa60HoldPosKd, kHa60HoldVelLimit,
+    pack_motorevo_servo(c.data, q, kHa60HoldPosKp, kHa60HoldPosKd, ha60_vref,
                         kHa60HoldVelKp, kHa60HoldVelKd, kHa60HoldVelKi);
     return;
   }
-  const float q = (enabled && have_q) ? q_hold : 0.f;
+  const float q = (enabled && have_q) ? q_cmd : 0.f;
   const float use_kp = enabled ? kp : 0.f;
   const float use_kd = enabled ? kd : 0.f;
-  pack_mit(c.data, use_kp, use_kd, q, 0.f, 0.f, lim);
+  const float use_dq = enabled ? dq : 0.f;
+  pack_mit(c.data, use_kp, use_kd, q, use_dq, 0.f, lim);
+}
+
+void print_triangle_table(const std::vector<IdStats> &st, float stroke)
+{
+  std::printf("\n=== P3 triangle q vs ±%.3f rad (probed q0, not firmware 0) ===\n",
+              static_cast<double>(stroke));
+  std::printf(" id  q0       q_min     q_max     peak_|q-q0|  |tau|peak\n");
+  for (const auto &s : st)
+  {
+    if (!s.have_q0)
+    {
+      std::printf(" %2u      -        -         -           -          -\n",
+                  static_cast<unsigned>(s.can_id));
+      continue;
+    }
+    std::printf(" %2u  % .4f  % .4f  % .4f  % .4f       % .3f\n",
+                static_cast<unsigned>(s.can_id), static_cast<double>(s.q0),
+                static_cast<double>(s.q_min), static_cast<double>(s.q_max),
+                static_cast<double>(s.q_peak_abs), static_cast<double>(s.tau_peak_abs));
+  }
 }
 
 void print_summary_table(const std::vector<IdStats> &st, std::uint64_t overruns,
@@ -507,6 +471,8 @@ const char *p3_bin_name(P3App app)
     return "p3_dual12_sync";
   case P3App::FaultInject:
     return "p3_fault_inject";
+  case P3App::Right6:
+    return "p3_right6_sync";
   }
   return "p3";
 }
@@ -521,34 +487,66 @@ void p3_print_usage(const P3Options &defaults)
       "  --duration SEC        default %.1f\n"
       "  --drain-ms MS         RX wait cap per cycle (default period-2)\n"
       "  --kp --kd             MIT hold gains (default %.1f / %.2f, cap kp<=%.0f)\n"
+      "  --stage hold|triangle default hold (q=last, tau=0). triangle: q_des += vel*dt,\n"
+      "                        reverse at each motor's probed q0 ±stroke, same phase,\n"
+      "                        same cycle (all selected IDs updated each tick).\n"
+      "                        Does not home to firmware 0 (no dm_home_to_zero).\n"
+      "                        HA60 uses evo servo θ_ref=q_des around probe q0.\n"
+      "                        --comms-only is unchanged (no 0xFC, no motion).\n"
+      "  --vel RAD/S           triangle ramp rate (default %.2f, cap %.2f)\n"
+      "  --stroke RAD          triangle reverse |q_des-q0| (default %.3f = ±20 deg)\n"
+      "  --abort-tau NM        abort if |tau_fb| exceeds (default %.0f; do not raise)\n"
       "  --ids 6               enable set (default 6). Example: --ids 6,8 or 3,4,5,6,7\n"
       "                        If given, cycle/summary is only those IDs (unlisted stay off).\n"
       "  --skip-motorevo [0|1] default 1; listing HA60 in --ids includes it (do not skip)\n"
       "  --no-skip-motorevo    include HA60 only if also in --ids\n"
       "  --require-all         exit 1 if any expected id has zero RX\n"
       "  --enable-all-anyway   enable --ids even if probe never replied\n"
-      "  --port PATH           left USB-CAN (left6 / fault)\n"
+      "  --comms-only          no 0xFC, no MIT hold/dq. RID + MIT kp=0 inquire\n"
+      "                        / HA60 evo status; 0xFD hygiene after. Right-only\n"
+      "                        is enough for p3_right6_sync (does not open left).\n"
+      "  --port PATH           left USB-CAN (dual12 / fault); right6: right USB-CAN\n"
       "  --left-port --right-port --yaml PATH\n"
-      "  --handshake --verbose --self-test\n",
+      "  --handshake --verbose --self-test --set-zero\n"
+      "  --set-zero            WRITES firmware zero at current shaft on selected\n"
+      "                        --ids (MIT 0xFE; HA60 V1 0xFE if listed). Not motion;\n"
+      "                        not 0xFC. Mutually exclusive with --stage hold|triangle.\n"
+      "                        Then 0xFD hygiene on those IDs.\n",
       bin, defaults.period_ms, defaults.duration_s, static_cast<double>(defaults.kp),
-      static_cast<double>(defaults.kd), static_cast<double>(kKpCap));
+      static_cast<double>(defaults.kd), static_cast<double>(kKpCap),
+      static_cast<double>(kVelDefault), static_cast<double>(kVelCap),
+      static_cast<double>(kStrokeDefault), static_cast<double>(kAbortTauDefault));
   if (defaults.app == P3App::Dual12)
   {
     std::printf(
-        "  --allow-single-bus    if ttyACM1 missing: error, then run left only\n");
+        "  --allow-single-bus    if ttyACM1 missing: error, then run left only\n"
+        "  --set-zero zeros the IDs this app selects (default --ids 6; skip\n"
+        "  Motorevo 8/14 unless listed). Current position → firmware origin on\n"
+        "  those IDs. Not motion; not 0xFC. Exclusive with --stage.\n");
   }
   if (defaults.app == P3App::FaultInject)
   {
     std::printf(
         "  --ignore-id N         simulate drop: do not send and do not wait (repeatable)\n"
-        "  P3 only records whether other IDs still update and whether the loop blocks.\n"
-        "  P5 will disable-all on comm-loss; that policy is NOT implemented here.\n");
+        "  P3 records whether other IDs still update and whether the loop blocks.\n"
+        "  Exit/SIGINT uses P5 disable-all (0xFD map 3-14 on open buses).\n");
+  }
+  if (defaults.app == P3App::Right6)
+  {
+    std::printf(
+        "  Right bus only (CAN 9-14). Default --ids 12 (not the whole 9-14 set),\n"
+        "  default port %s.\n"
+        "  If ACM swapped: identity looks for ID12 D[0]=0x0C and uses that port.\n"
+        "  --set-zero writes firmware zero on those selected IDs at the current\n"
+        "  shaft (default 12). Not motion; not 0xFC. Exclusive with --stage.\n"
+        "  HA60 ID14 uses evo V1 0xFE when listed in --ids / --no-skip-motorevo.\n",
+        kDefaultPortRight);
   }
   std::printf(
       "  Safety: default --ids 6. Big warning if enabling more than one motor.\n"
       "  Without --ids: probe all Damiao on opened buses (3-7 / 9-13); skip Motorevo.\n"
       "  With --ids: only those CAN IDs are sent/expected/enabled (HA60 if listed).\n"
-      "  Disable 0xFD on selected ids at exit/SIGINT.\n");
+      "  Exit/SIGINT: P5 disable-all 0xFD on map IDs of open buses.\n");
 }
 
 bool p3_parse_args(int argc, char **argv, P3Options &opt, std::string &err)
@@ -614,6 +612,59 @@ bool p3_parse_args(int argc, char **argv, P3Options &opt, std::string &err)
       }
       opt.kd = std::strtof(v, nullptr);
     }
+    else if (std::strcmp(argv[i], "--stage") == 0)
+    {
+      const char *v = need("--stage");
+      if (v == nullptr)
+      {
+        return false;
+      }
+      if (std::strcmp(v, "hold") == 0)
+      {
+        opt.stage = P3Stage::Hold;
+      }
+      else if (std::strcmp(v, "triangle") == 0)
+      {
+        opt.stage = P3Stage::Triangle;
+      }
+      else
+      {
+        err = "--stage must be hold|triangle";
+        return false;
+      }
+      opt.stage_set = true;
+    }
+    else if (std::strcmp(argv[i], "--set-zero") == 0)
+    {
+      opt.set_zero = true;
+    }
+    else if (std::strcmp(argv[i], "--vel") == 0)
+    {
+      const char *v = need("--vel");
+      if (v == nullptr)
+      {
+        return false;
+      }
+      opt.vel = std::strtof(v, nullptr);
+    }
+    else if (std::strcmp(argv[i], "--stroke") == 0)
+    {
+      const char *v = need("--stroke");
+      if (v == nullptr)
+      {
+        return false;
+      }
+      opt.stroke = std::strtof(v, nullptr);
+    }
+    else if (std::strcmp(argv[i], "--abort-tau") == 0)
+    {
+      const char *v = need("--abort-tau");
+      if (v == nullptr)
+      {
+        return false;
+      }
+      opt.abort_tau = std::strtof(v, nullptr);
+    }
     else if (std::strcmp(argv[i], "--ids") == 0)
     {
       const char *v = need("--ids");
@@ -677,6 +728,10 @@ bool p3_parse_args(int argc, char **argv, P3Options &opt, std::string &err)
     {
       opt.enable_all_anyway = true;
     }
+    else if (std::strcmp(argv[i], "--comms-only") == 0)
+    {
+      opt.comms_only = true;
+    }
     else if (std::strcmp(argv[i], "--port") == 0)
     {
       const char *v = need("--port");
@@ -684,8 +739,16 @@ bool p3_parse_args(int argc, char **argv, P3Options &opt, std::string &err)
       {
         return false;
       }
-      opt.left_port = v;
-      left_port_set = true;
+      if (opt.app == P3App::Right6)
+      {
+        opt.right_port = v;
+        right_port_set = true;
+      }
+      else
+      {
+        opt.left_port = v;
+        left_port_set = true;
+      }
     }
     else if (std::strcmp(argv[i], "--left-port") == 0)
     {
@@ -735,6 +798,12 @@ bool p3_parse_args(int argc, char **argv, P3Options &opt, std::string &err)
     }
   }
 
+  if (opt.set_zero && opt.stage_set)
+  {
+    err = "refuse: --set-zero cannot be combined with --stage";
+    return false;
+  }
+
   if (opt.left_port.empty())
   {
     opt.left_port = kDefaultPortLeft;
@@ -746,7 +815,7 @@ bool p3_parse_args(int argc, char **argv, P3Options &opt, std::string &err)
   if (!opt.yaml_path.empty() && (!left_port_set || !right_port_set))
   {
     std::string yl, yr;
-    if (!yaml_ports(opt.yaml_path, yl, yr))
+    if (!yaml_bus_ports(opt.yaml_path, &yl, &yr))
     {
       err = "yaml overlay missing buses.*.port: " + opt.yaml_path;
       return false;
@@ -796,6 +865,38 @@ bool p3_parse_args(int argc, char **argv, P3Options &opt, std::string &err)
                 static_cast<double>(opt.kd), static_cast<double>(kKdCap));
     opt.kd = kKdCap;
   }
+  if (opt.vel < 0.f)
+  {
+    opt.vel = -opt.vel;
+  }
+  if (opt.vel < 0.05f)
+  {
+    opt.vel = 0.05f;
+  }
+  if (opt.vel > kVelCap)
+  {
+    std::printf("WARN: clamping vel %.3f -> %.2f rad/s (conservative 6-motor swing)\n",
+                static_cast<double>(opt.vel), static_cast<double>(kVelCap));
+    opt.vel = kVelCap;
+  }
+  if (opt.stroke < 0.f)
+  {
+    opt.stroke = -opt.stroke;
+  }
+  if (opt.stroke < 0.02f)
+  {
+    opt.stroke = 0.02f;
+  }
+  if (opt.abort_tau < 1.f)
+  {
+    opt.abort_tau = 1.f;
+  }
+  if (opt.abort_tau > kAbortTauDefault)
+  {
+    std::printf("WARN: clamping abort-tau %.1f -> %.0f (do not raise)\n",
+                static_cast<double>(opt.abort_tau), static_cast<double>(kAbortTauDefault));
+    opt.abort_tau = kAbortTauDefault;
+  }
   return true;
 }
 
@@ -814,8 +915,10 @@ int p3_run(const P3Options &opt_in)
     return 0;
   }
 
-  const bool want_right = opt.app == P3App::Dual12;
-  const bool left_only = !want_right;
+  const bool want_left = opt.app != P3App::Right6;
+  const bool want_right = opt.app == P3App::Dual12 || opt.app == P3App::Right6;
+  const bool left_only = want_left && !want_right;
+  const bool right_only = want_right && !want_left;
 
   bool listed_ha60 = false;
   for (uint8_t id : opt.ids)
@@ -832,6 +935,12 @@ int p3_run(const P3Options &opt_in)
                    static_cast<unsigned>(id));
       return 2;
     }
+    if (right_only && e->bus != BusId::Right)
+    {
+      std::fprintf(stderr, "CAN ID %u is on the left bus; this app is right-only\n",
+                   static_cast<unsigned>(id));
+      return 2;
+    }
     if (e->model == MotorType::HA60)
     {
       listed_ha60 = true;
@@ -839,8 +948,16 @@ int p3_run(const P3Options &opt_in)
   }
   if (listed_ha60 && opt.skip_motorevo)
   {
-    std::printf("NOTE: --ids includes Motorevo HA60; including servo hold (skip_motorevo=0)\n");
+    std::printf("NOTE: --ids includes Motorevo HA60; skip_motorevo=0\n");
     opt.skip_motorevo = false;
+  }
+  if (opt.comms_only)
+  {
+    std::printf("comms-only: no 0xFC, no MIT hold/dq; RID + kp=0 inquire / HA60 evo status\n");
+    if (opt.stage == P3Stage::Triangle)
+    {
+      std::printf("comms-only: ignoring --stage triangle (no motion)\n");
+    }
   }
 
   std::signal(SIGINT, on_signal);
@@ -849,19 +966,40 @@ int p3_run(const P3Options &opt_in)
 
   UsbCanAdapter left_ad(opt.left_port);
   UsbCanAdapter right_ad(opt.right_port);
-  if (!left_ad.open())
+  const std::string right_alt_path =
+      opt.right_port == kDefaultPortLeft ? std::string(kDefaultPortRight)
+                                        : std::string(kDefaultPortLeft);
+  UsbCanAdapter right_alt(right_alt_path);
+
+  bool left_open = false;
+  if (want_left)
   {
-    std::fprintf(stderr, "open left %s failed: %s\n", opt.left_port.c_str(),
-                 left_ad.last_error().c_str());
-    return 1;
+    if (!left_ad.open())
+    {
+      std::fprintf(stderr, "open left %s failed: %s\n", opt.left_port.c_str(),
+                   left_ad.last_error().c_str());
+      return 1;
+    }
+    left_open = true;
+    g_left = &left_ad;
+    std::printf("opened left %s; USB2CAN CAN baud %u bps cmd=55 05 %02X AA 55\n",
+                opt.left_port.c_str(), left_ad.can_bitrate(),
+                static_cast<unsigned>(left_ad.can_baud_index()));
   }
-  std::printf("opened left %s; USB2CAN CAN baud %u bps cmd=55 05 %02X AA 55\n",
-              opt.left_port.c_str(), left_ad.can_bitrate(),
-              static_cast<unsigned>(left_ad.can_baud_index()));
-  g_left = &left_ad;
 
   bool right_open = false;
-  if (want_right)
+  if (opt.app == P3App::Right6)
+  {
+    UsbCanAdapter *used =
+        open_right6_port(right_ad, right_alt, opt.right_port, right_alt_path);
+    if (used == nullptr)
+    {
+      return 1;
+    }
+    right_open = true;
+    g_right = used;
+  }
+  else if (want_right)
   {
     if (right_ad.open())
     {
@@ -884,19 +1022,101 @@ int p3_run(const P3Options &opt_in)
       std::printf("WARN: --allow-single-bus: continuing with left only\n");
     }
   }
+  safety_bind_buses(g_left, g_right);
 
   if (opt.handshake)
   {
-    left_ad.handshake();
-    usleep(20000);
-    left_ad.drain();
-    if (right_open)
+    if (left_open)
     {
-      right_ad.handshake();
+      left_ad.handshake();
       usleep(20000);
-      right_ad.drain();
+      left_ad.drain();
+    }
+    if (right_open && g_right != nullptr)
+    {
+      g_right->handshake();
+      usleep(20000);
+      g_right->drain();
     }
     std::printf("handshake sent (CMD 0x02)\n");
+  }
+
+  if (opt.set_zero)
+  {
+    std::printf(
+        "\n"
+        "**********************************************************************\n"
+        "* WARN: --set-zero WRITES firmware zero at current shaft position.  *\n"
+        "* Selected --ids only. MIT 0xFE / HA60 V1 0xFE. No 0xFC.            *\n"
+        "* Irreversible-ish. Shafts must be at the intended origin.          *\n"
+        "**********************************************************************\n");
+    bool all_ok = true;
+    bool any = false;
+    for (uint8_t id : opt.ids)
+    {
+      const auto *e = find_by_can_id(id);
+      if (e == nullptr)
+      {
+        continue;
+      }
+      if (e->model == MotorType::HA60 && opt.skip_motorevo)
+      {
+        std::printf("skip set-zero id=%u (Motorevo HA60; list in --ids or --no-skip-motorevo)\n",
+                    static_cast<unsigned>(id));
+        continue;
+      }
+      UsbCanAdapter *ad = adapter_for(id);
+      if (ad == nullptr || !ad->is_open())
+      {
+        std::fprintf(stderr, "skip set-zero id=%u (adapter not open)\n",
+                     static_cast<unsigned>(id));
+        all_ok = false;
+        continue;
+      }
+      any = true;
+      bool ok = false;
+      if (e->model == MotorType::HA60)
+      {
+        uint8_t z[8] = {};
+        pack_motorevo_set_zero(z);
+        ok = ad->sendCan(id, z, 8);
+        usleep(kDisableGapUs);
+        std::printf("set-zero id=%u %s (V1 0xFE) data=FF FF FF FF FF FF FF FE\n",
+                    static_cast<unsigned>(id), ok ? "sent" : "TX FAIL");
+      }
+      else
+      {
+        ok = dm_send_set_zero(*ad, id);
+        std::printf("set-zero id=%u %s (0xFE) data=FF FF FF FF FF FF FF FE\n",
+                    static_cast<unsigned>(id), ok ? "sent" : "TX FAIL");
+      }
+      if (ok)
+      {
+        dm_send_disable(*ad, id);
+        std::printf("disable id=%u sent (0xFD)\n", static_cast<unsigned>(id));
+      }
+      else
+      {
+        all_ok = false;
+      }
+    }
+    if (!any)
+    {
+      std::fprintf(stderr, "--set-zero: no selected IDs to write\n");
+      all_ok = false;
+    }
+    if (left_open)
+    {
+      left_ad.close();
+    }
+    if (g_right != nullptr)
+    {
+      g_right->close();
+    }
+    g_left = nullptr;
+    g_right = nullptr;
+    safety_bind_buses(nullptr, nullptr);
+    return all_ok ? 0 : 1;
   }
 
   std::vector<uint8_t> left_expected;
@@ -915,11 +1135,11 @@ int p3_run(const P3Options &opt_in)
       {
         continue;
       }
-      if (e->bus == BusId::Left)
+      if (e->bus == BusId::Left && left_open)
       {
         add_unique(left_expected, id);
       }
-      else if (right_open)
+      else if (e->bus == BusId::Right && right_open)
       {
         add_unique(right_expected, id);
       }
@@ -927,7 +1147,8 @@ int p3_run(const P3Options &opt_in)
   }
   else
   {
-    left_expected = expected_ids(BusId::Left, opt.skip_motorevo);
+    left_expected = left_open ? expected_ids(BusId::Left, opt.skip_motorevo)
+                              : std::vector<uint8_t>{};
     right_expected = right_open ? expected_ids(BusId::Right, opt.skip_motorevo)
                                  : std::vector<uint8_t>{};
     // Motorevo enters expected set only when we will actually send to it.
@@ -942,11 +1163,11 @@ int p3_run(const P3Options &opt_in)
           {
             continue;
           }
-          if (e->bus == BusId::Left)
+          if (e->bus == BusId::Left && left_open)
           {
             add_unique(left_expected, id);
           }
-          else if (right_open)
+          else if (e->bus == BusId::Right && right_open)
           {
             add_unique(right_expected, id);
           }
@@ -979,8 +1200,18 @@ int p3_run(const P3Options &opt_in)
   FrameDemux left_demux;
   FrameDemux right_demux;
   BusCycle left_cycle(left_ad, BusId::Left, left_demux);
-  BusCycle right_cycle(right_ad, BusId::Right, right_demux);
-  DualBusCycle dual(&left_cycle, right_open ? &right_cycle : nullptr);
+  BusCycle right_cycle_primary(right_ad, BusId::Right, right_demux);
+  BusCycle right_cycle_alt(right_alt, BusId::Right, right_demux);
+  BusCycle *right_cycle = nullptr;
+  if (right_open && g_right == &right_alt)
+  {
+    right_cycle = &right_cycle_alt;
+  }
+  else if (right_open)
+  {
+    right_cycle = &right_cycle_primary;
+  }
+  DualBusCycle dual(left_open ? &left_cycle : nullptr, right_cycle);
 
   auto build_cmds = [&](const std::vector<uint8_t> &ids, const std::unordered_set<uint8_t> &enable,
                         bool inquiry_only) -> std::vector<CycleMotorCmd> {
@@ -996,9 +1227,15 @@ int p3_run(const P3Options &opt_in)
       const bool ignore = contains_id(opt.ignore_ids, id);
       const bool en = !inquiry_only && enable.count(id) != 0;
       auto *st = find_stats(stats, id);
+      const bool tri = en && opt.stage == P3Stage::Triangle;
+      const float q_cmd = (st == nullptr) ? 0.f : (tri ? st->q_des : st->last_q);
+      const bool have_q =
+          st != nullptr && (tri ? st->have_q0 : st->have_q);
+      const float dq = (tri && st != nullptr) ? st->vel_sign * opt.vel : 0.f;
+      const float vref = tri ? std::max(kHa60HoldVelLimit, opt.vel) : kHa60HoldVelLimit;
       CycleMotorCmd c;
-      pack_cmd_for(c, *e, lims[id & 0x0F], !ignore, !ignore, en, opt.kp, opt.kd,
-                   st != nullptr ? st->last_q : 0.f, st != nullptr && st->have_q);
+      pack_cmd_for(c, *e, lims[id & 0x0F], !ignore, !ignore, en, opt.kp, opt.kd, q_cmd,
+                   have_q, dq, vref);
       cmds.push_back(c);
     }
     return cmds;
@@ -1009,9 +1246,12 @@ int p3_run(const P3Options &opt_in)
 
   std::printf(
       "P3 %s  period=%dms drain=%dms duration=%.1fs kp=%.1f kd=%.2f skip_motorevo=%d\n"
+      "stage=%s vel=%.3f stroke=±%.3f abort-tau=%.0f\n"
       "expected left:",
       p3_bin_name(opt.app), opt.period_ms, opt.drain_ms, opt.duration_s,
-      static_cast<double>(opt.kp), static_cast<double>(opt.kd), opt.skip_motorevo ? 1 : 0);
+      static_cast<double>(opt.kp), static_cast<double>(opt.kd), opt.skip_motorevo ? 1 : 0,
+      opt.stage == P3Stage::Triangle ? "triangle" : "hold", static_cast<double>(opt.vel),
+      static_cast<double>(opt.stroke), static_cast<double>(opt.abort_tau));
   for (uint8_t id : left_expected)
   {
     std::printf(" %u", static_cast<unsigned>(id));
@@ -1038,7 +1278,7 @@ int p3_run(const P3Options &opt_in)
     {
       std::printf(" %u", static_cast<unsigned>(id));
     }
-    std::printf("  (P3 records only; P5 will disable-all)\n");
+    std::printf("  (P3 records only during the loop; exit uses P5 disable-all)\n");
   }
 
   // Presence probe: inquiry MIT (kp=0) to every expected id. Bounded drain, no hang.
@@ -1048,16 +1288,9 @@ int p3_run(const P3Options &opt_in)
   {
     auto lc = build_cmds(left_expected, {}, true);
     auto rc = build_cmds(right_expected, {}, true);
-    DualBusCycleResult tick;
-    if (want_right)
-    {
-      tick = dual.tick(&lc, right_open ? &rc : nullptr, drain, period, nullptr, nullptr);
-    }
-    else
-    {
-      tick.left = left_cycle.tick(lc, drain, period, nullptr);
-      tick.left_used = true;
-    }
+    DualBusCycleResult tick =
+        dual.tick(left_open ? &lc : nullptr, right_open ? &rc : nullptr, drain, period, nullptr,
+                  nullptr);
     auto mark = [&](const BusCycleResult &br) {
       for (const auto &m : br.motors)
       {
@@ -1114,6 +1347,60 @@ int p3_run(const P3Options &opt_in)
   }
   std::printf("\n");
 
+  std::vector<uint8_t> actually_enabled;
+  if (opt.comms_only)
+  {
+    std::printf("comms-only RID / evo status (read-only; no CTRL_MODE write, no 0xFC):\n");
+    for (uint8_t id : all_expected)
+    {
+      const auto *e = find_by_can_id(id);
+      const bool here = present.count(id) != 0;
+      if (e == nullptr)
+      {
+        continue;
+      }
+      if (e->model == MotorType::HA60)
+      {
+        std::printf("id=%u HA60 %s present=%d (no Damiao RID; evo servo kp=0 inquire)\n",
+                    static_cast<unsigned>(id), to_string(e->joint), here ? 1 : 0);
+        continue;
+      }
+      if (!here)
+      {
+        std::printf("id=%u %s %s missing; skip RID\n", static_cast<unsigned>(id),
+                    to_string(e->model), to_string(e->joint));
+        continue;
+      }
+      UsbCanAdapter *ad = adapter_for(id);
+      FrameDemux *dm = demux_for(id, left_demux, right_demux);
+      if (ad == nullptr || !ad->is_open() || dm == nullptr)
+      {
+        std::printf("id=%u skip RID (adapter not open)\n", static_cast<unsigned>(id));
+        continue;
+      }
+      DmMitEnableStatus rst;
+      LimitParam lim = lims[id & 0x0F];
+      dm_read_pvt_limits(*ad, *dm, id, lim, &rst);
+      if (rst.rid_ok)
+      {
+        lims[id & 0x0F] = lim;
+      }
+      float mode_f = 0.f;
+      const bool cm_ok =
+          dm_read_rid(*ad, *dm, id, static_cast<uint8_t>(DmRid::CtrlMode), mode_f);
+      const uint32_t cm = static_cast<uint32_t>(mode_f + 0.5f);
+      std::printf("id=%u %s %s RID 21/22/23 PMAX=%s%.4f VMAX=%s%.4f TMAX=%s%.4f "
+                  "CTRL_MODE=%s%u (%s)\n",
+                  static_cast<unsigned>(id), to_string(e->model), to_string(e->joint),
+                  rst.pmax_ok ? "" : "FAIL ", static_cast<double>(rst.pmax),
+                  rst.vmax_ok ? "" : "FAIL ", static_cast<double>(rst.vmax),
+                  rst.tmax_ok ? "" : "FAIL ", static_cast<double>(rst.tmax),
+                  cm_ok ? "" : "FAIL ", static_cast<unsigned>(cm),
+                  cm_ok ? dm_ctrl_mode_name(cm) : "?");
+    }
+  }
+  else
+  {
   std::vector<uint8_t> enable_ids;
   for (uint8_t id : opt.ids)
   {
@@ -1144,7 +1431,6 @@ int p3_run(const P3Options &opt_in)
   }
 
   // RID + CTRL_MODE + 0xFC for Damiao; Motorevo HA60 also 0xFC then conservative servo hold.
-  std::vector<uint8_t> actually_enabled;
   for (uint8_t id : enable_ids)
   {
     const auto *e = find_by_can_id(id);
@@ -1185,62 +1471,58 @@ int p3_run(const P3Options &opt_in)
 
     if (e->model == MotorType::DM10422)
     {
-      float pmax = 0.f, vmax = 0.f, tmax = 0.f;
-      const bool pok =
-          read_rid_retries(*ad, *dm, id, static_cast<uint8_t>(DmRid::Pmax), pmax);
-      const bool vok =
-          read_rid_retries(*ad, *dm, id, static_cast<uint8_t>(DmRid::Vmax), vmax);
-      const bool tok =
-          read_rid_retries(*ad, *dm, id, static_cast<uint8_t>(DmRid::Tmax), tmax);
+      DmMitEnableStatus st;
+      const DmMitEnableErr en = dm_enable_mit(*ad, *dm, id, true, st);
       std::printf("id=%u RID 21/22/23 PMAX=%s%.4f VMAX=%s%.4f TMAX=%s%.4f\n",
-                  static_cast<unsigned>(id), pok ? "" : "FAIL ", static_cast<double>(pmax),
-                  vok ? "" : "FAIL ", static_cast<double>(vmax), tok ? "" : "FAIL ",
-                  static_cast<double>(tmax));
-      if (!(pok && vok && tok && pmax > 0.1f && vmax > 0.1f && tmax > 0.1f))
+                  static_cast<unsigned>(id), st.pmax_ok ? "" : "FAIL ",
+                  static_cast<double>(st.pmax), st.vmax_ok ? "" : "FAIL ",
+                  static_cast<double>(st.vmax), st.tmax_ok ? "" : "FAIL ",
+                  static_cast<double>(st.tmax));
+      if (en == DmMitEnableErr::Rid)
       {
         std::fprintf(stderr,
                      "REFUSE enable id=%u: DM10422 limits UNVERIFIED (RID 21/22/23 failed)\n",
                      static_cast<unsigned>(id));
         continue;
       }
-      lims[id & 0x0F] = LimitParam{pmax, vmax, tmax};
+      lims[id & 0x0F] = st.lim;
+      std::printf("id=%u CTRL_MODE before=%s%u write=%s after=%s%u (%s)\n",
+                  static_cast<unsigned>(id), st.ctrl_before_ok ? "" : "FAIL ",
+                  static_cast<unsigned>(st.ctrl_before), st.wrote_ack ? "ack" : "NO-ACK",
+                  st.ctrl_after_ok ? "" : "FAIL ", static_cast<unsigned>(st.ctrl_after),
+                  dm_ctrl_mode_name(st.ctrl_after));
+      if (en != DmMitEnableErr::Ok)
+      {
+        if (en == DmMitEnableErr::CtrlMode)
+        {
+          std::fprintf(stderr, "REFUSE enable id=%u: need CTRL_MODE=MIT(1)\n",
+                       static_cast<unsigned>(id));
+        }
+        else
+        {
+          std::fprintf(stderr, "enable send failed id=%u\n", static_cast<unsigned>(id));
+        }
+        continue;
+      }
+      std::printf("enable id=%u sent (0xFC)\n", static_cast<unsigned>(id));
+      actually_enabled.push_back(id);
+      continue;
     }
 
-    uint8_t dis[8] = {};
-    pack_disable(dis);
-    ad->sendCan(id, dis, 8);
-    usleep(kDisableGapUs);
-    ad->sendCan(id, dis, 8);
-    usleep(kDisableGapUs);
-    ad->drain();
-    dm->clear();
-
-    float mode_f = 0.f;
-    const bool before_ok =
-        read_rid_retries(*ad, *dm, id, static_cast<uint8_t>(DmRid::CtrlMode), mode_f);
-    const uint32_t before = static_cast<uint32_t>(mode_f + 0.5f);
-    const bool wrote = write_rid_u32_retries(*ad, *dm, id, static_cast<uint8_t>(DmRid::CtrlMode),
-                                             kDmMitMode);
-    usleep(20000);
-    mode_f = 0.f;
-    const bool after_ok =
-        read_rid_retries(*ad, *dm, id, static_cast<uint8_t>(DmRid::CtrlMode), mode_f);
-    const uint32_t after = static_cast<uint32_t>(mode_f + 0.5f);
+    DmMitEnableStatus st;
+    const DmMitEnableErr en = dm_enable_mit(*ad, *dm, id, false, st);
     std::printf("id=%u CTRL_MODE before=%s%u write=%s after=%s%u (%s)\n",
-                static_cast<unsigned>(id), before_ok ? "" : "FAIL ",
-                static_cast<unsigned>(before), wrote ? "ack" : "NO-ACK",
-                after_ok ? "" : "FAIL ", static_cast<unsigned>(after),
-                dm_ctrl_mode_name(after));
-    if (!after_ok || after != kDmMitMode)
+                static_cast<unsigned>(id), st.ctrl_before_ok ? "" : "FAIL ",
+                static_cast<unsigned>(st.ctrl_before), st.wrote_ack ? "ack" : "NO-ACK",
+                st.ctrl_after_ok ? "" : "FAIL ", static_cast<unsigned>(st.ctrl_after),
+                dm_ctrl_mode_name(st.ctrl_after));
+    if (en == DmMitEnableErr::CtrlMode)
     {
       std::fprintf(stderr, "REFUSE enable id=%u: need CTRL_MODE=MIT(1)\n",
                    static_cast<unsigned>(id));
       continue;
     }
-
-    uint8_t en[8] = {};
-    pack_enable(en);
-    if (!ad->sendCan(id, en, 8))
+    if (en != DmMitEnableErr::Ok)
     {
       std::fprintf(stderr, "enable send failed id=%u\n", static_cast<unsigned>(id));
       continue;
@@ -1249,20 +1531,59 @@ int p3_run(const P3Options &opt_in)
     actually_enabled.push_back(id);
   }
   usleep(kEnableSettleUs);
-  left_ad.drain();
-  if (right_open)
+  if (left_open)
   {
-    right_ad.drain();
+    left_ad.drain();
+  }
+  if (right_open && g_right != nullptr)
+  {
+    g_right->drain();
   }
 
-  arm_disable(actually_enabled);
+  if (!actually_enabled.empty())
+  {
+    safety_arm();
+  }
+  }  // !comms_only
   std::unordered_set<uint8_t> enable_set(actually_enabled.begin(), actually_enabled.end());
   for (auto &s : stats)
   {
     s.enabled = enable_set.count(s.can_id) != 0;
+    if (s.have_q)
+    {
+      s.q0 = s.last_q;
+      s.q_des = s.last_q;
+      s.q_min = s.last_q;
+      s.q_max = s.last_q;
+      s.have_q0 = true;
+      s.vel_sign = 1.f;
+    }
   }
 
-  if (actually_enabled.empty())
+  const bool do_triangle =
+      !opt.comms_only && opt.stage == P3Stage::Triangle && !actually_enabled.empty();
+  if (do_triangle)
+  {
+    std::printf("triangle: no firmware-zero home; q_des reverse at probed q0 ±%.3f rad\n"
+                "same phase/period: all enabled IDs each %d ms tick  vel=%.3f abort-tau=%.0f\n"
+                "q0",
+                static_cast<double>(opt.stroke), opt.period_ms, static_cast<double>(opt.vel),
+                static_cast<double>(opt.abort_tau));
+    for (const auto &s : stats)
+    {
+      if (s.enabled && s.have_q0)
+      {
+        std::printf(" id%u=%.4f", static_cast<unsigned>(s.can_id), static_cast<double>(s.q0));
+      }
+    }
+    std::printf("\n");
+  }
+
+  if (opt.comms_only)
+  {
+    std::printf("comms-only inquire loop (kp=0 MIT / HA60 evo status). 0xFC not sent.\n");
+  }
+  else if (actually_enabled.empty())
   {
     std::printf("no motors enabled; running inquiry-only (kp=0) for drop accounting\n");
   }
@@ -1272,31 +1593,59 @@ int p3_run(const P3Options &opt_in)
   PeriodJitterStats jitter{static_cast<double>(opt.period_ms) * 1000.0};
   std::uint64_t cycles = 0;
   std::uint64_t overruns = 0;
+  bool aborted = false;
   const auto t0 = BusCycle::Clock::now();
   const auto duration = std::chrono::duration<double>(opt.duration_s);
   auto next = t0;
   auto last_print = t0;
+  const float dt = static_cast<float>(opt.period_ms) * 0.001f;
+  const float abort_q = opt.stroke + kAbortQMargin;
 
-  std::printf("hold loop start (q=last, tau=0). SIGINT disables selected ids.\n");
-
-  while (g_run.load() && (BusCycle::Clock::now() - t0) < duration)
+  if (!opt.comms_only)
   {
-    next += period;
-    auto lc = build_cmds(left_expected, enable_set, false);
-    auto rc = build_cmds(right_expected, enable_set, false);
-    DualBusCycleResult tick;
-    const auto t_send = BusCycle::Clock::now();
-    if (want_right)
+    if (do_triangle)
     {
-      tick = dual.tick(&lc, right_open ? &rc : nullptr, drain, period, &left_log, &right_log);
+      std::printf("triangle loop start (q_des += vel*dt, reverse at probed q0±stroke). "
+                  "SIGINT disables selected ids.\n");
     }
     else
     {
-      tick.left = left_cycle.tick(lc, drain, period, &left_log);
-      tick.left_used = true;
-      tick.elapsed_ms = tick.left.elapsed_ms;
-      tick.overrun = tick.left.overrun;
+      std::printf("hold loop start (q=last, tau=0). SIGINT disables selected ids.\n");
     }
+  }
+
+  while (g_run.load() && !aborted && (BusCycle::Clock::now() - t0) < duration)
+  {
+    next += period;
+    if (do_triangle)
+    {
+      for (auto &s : stats)
+      {
+        if (!s.enabled || !s.have_q0)
+        {
+          continue;
+        }
+        s.q_des += s.vel_sign * opt.vel * dt;
+        const float q_hi = s.q0 + opt.stroke;
+        const float q_lo = s.q0 - opt.stroke;
+        if (s.q_des > q_hi)
+        {
+          s.q_des = q_hi;
+          s.vel_sign = -1.f;
+        }
+        else if (s.q_des < q_lo)
+        {
+          s.q_des = q_lo;
+          s.vel_sign = 1.f;
+        }
+      }
+    }
+    auto lc = build_cmds(left_expected, enable_set, opt.comms_only);
+    auto rc = build_cmds(right_expected, enable_set, opt.comms_only);
+    const auto t_send = BusCycle::Clock::now();
+    DualBusCycleResult tick =
+        dual.tick(left_open ? &lc : nullptr, right_open ? &rc : nullptr, drain, period,
+                  left_open ? &left_log : nullptr, right_open ? &right_log : nullptr);
     accumulate(stats, tick.left);
     accumulate(stats, tick.right);
     ++cycles;
@@ -1308,6 +1657,35 @@ int p3_run(const P3Options &opt_in)
         std::chrono::duration<double, std::micro>(BusCycle::Clock::now() - t_send).count();
     jitter.push(dt_us);
 
+    if (do_triangle)
+    {
+      for (const auto &s : stats)
+      {
+        if (!s.enabled || !s.have_q)
+        {
+          continue;
+        }
+        if (std::fabs(s.last_tau) > opt.abort_tau)
+        {
+          std::fprintf(stderr, "ABORT id=%u: |tau_fb|=%.3f > %.3f Nm\n",
+                       static_cast<unsigned>(s.can_id),
+                       static_cast<double>(std::fabs(s.last_tau)),
+                       static_cast<double>(opt.abort_tau));
+          safety_set_reason(SafetyReason::HardLimitTau);
+          aborted = true;
+        }
+        if (s.have_q0 && std::fabs(s.last_q - s.q0) > abort_q)
+        {
+          std::fprintf(stderr, "ABORT id=%u: |q-q0|=%.4f > stroke+margin %.4f\n",
+                       static_cast<unsigned>(s.can_id),
+                       static_cast<double>(std::fabs(s.last_q - s.q0)),
+                       static_cast<double>(abort_q));
+          safety_set_reason(SafetyReason::HardLimitQ);
+          aborted = true;
+        }
+      }
+    }
+
     const auto now = BusCycle::Clock::now();
     const bool print_now =
         opt.verbose || cycles <= 3 ||
@@ -1317,7 +1695,7 @@ int p3_run(const P3Options &opt_in)
       std::printf("cycle %llu elapsed=%.2fms overrun=%d  ",
                   static_cast<unsigned long long>(cycles), tick.elapsed_ms,
                   tick.overrun ? 1 : 0);
-      auto dump = [](const BusCycleResult &br) {
+      auto dump = [&](const BusCycleResult &br) {
         for (const auto &m : br.motors)
         {
           if (m.skipped)
@@ -1326,8 +1704,21 @@ int p3_run(const P3Options &opt_in)
           }
           else if (m.rx_ok)
           {
-            std::printf("id%u=ok(rtt=%.2f%s) ", static_cast<unsigned>(m.can_id), m.rtt_ms,
-                        m.have_fb ? "" : "");
+            if (do_triangle)
+            {
+              auto *st = find_stats(stats, m.can_id);
+              const float qdes = st != nullptr ? st->q_des : 0.f;
+              std::printf("id%u=ok(rtt=%.2f q=%.4f qdes=%.4f tau=%.3f) ",
+                          static_cast<unsigned>(m.can_id), m.rtt_ms,
+                          static_cast<double>(m.have_fb ? m.fb.q : 0.f),
+                          static_cast<double>(qdes),
+                          static_cast<double>(m.have_fb ? m.fb.tau : 0.f));
+            }
+            else
+            {
+              std::printf("id%u=ok(rtt=%.2f%s) ", static_cast<unsigned>(m.can_id), m.rtt_ms,
+                          m.have_fb ? "" : "");
+            }
           }
           else
           {
@@ -1350,15 +1741,44 @@ int p3_run(const P3Options &opt_in)
   }
 
   print_summary_table(stats, overruns, cycles);
+  if (do_triangle)
+  {
+    print_triangle_table(stats, opt.stroke);
+    std::printf("triangle: %s\n", aborted ? "ABORT" : "clean (duration)");
+  }
   std::printf("jitter_us mean=%.1f max_dev=%.1f  (period=%d ms)\n", jitter.mean_us(),
               jitter.max_deviation_us(), opt.period_ms);
+  if (opt.comms_only)
+  {
+    std::printf("comms-only errors (fb.err != 0 during inquire):\n");
+    for (const auto &s : stats)
+    {
+      std::printf(" id=%u present_probe=%d sent=%llu rx=%llu drop=%llu err_n=%llu last_err=%u\n",
+                  static_cast<unsigned>(s.can_id), s.present_probe ? 1 : 0,
+                  static_cast<unsigned long long>(s.sent),
+                  static_cast<unsigned long long>(s.rx),
+                  static_cast<unsigned long long>(s.drop),
+                  static_cast<unsigned long long>(s.err_n),
+                  static_cast<unsigned>(s.last_err));
+    }
+    std::printf("comms-only: 0xFC sent=0\n");
+    for (uint8_t id : all_expected)
+    {
+      UsbCanAdapter *ad = adapter_for(id);
+      if (ad != nullptr && ad->is_open())
+      {
+        dm_send_disable(*ad, id);
+        std::printf("disable id=%u sent (0xFD hygiene)\n", static_cast<unsigned>(id));
+      }
+    }
+  }
 
   if (opt.app == P3App::FaultInject)
   {
     std::printf(
         "fault-inject note: ignored IDs are not waited on; other IDs should still update\n"
         "if they are on the bus. Loop is bounded by --drain-ms (does not hang).\n"
-        "P5 will disable-all on comm-loss; P3 only recorded drops.\n");
+        "Exit uses P5 disable-all; this loop only recorded drops.\n");
     bool others_rx = false;
     bool ignored_waited = false;
     for (const auto &s : stats)
@@ -1381,15 +1801,19 @@ int p3_run(const P3Options &opt_in)
   }
 
   disable_all_now(true);
+  if (left_open)
+  {
+    left_ad.close();
+  }
+  if (g_right != nullptr)
+  {
+    g_right->close();
+  }
   g_left = nullptr;
   g_right = nullptr;
-  left_ad.close();
-  if (right_open)
-  {
-    right_ad.close();
-  }
+  safety_bind_buses(nullptr, nullptr);
 
-  int rc = 0;
+  int rc = aborted ? 1 : 0;
   if (opt.require_all)
   {
     for (const auto &s : stats)
@@ -1421,7 +1845,7 @@ int p3_run(const P3Options &opt_in)
   }
   if (!opt.ids.empty() && !selected_rx && opt.ignore_ids.empty())
   {
-    std::fprintf(stderr, "none of --ids got RX during the hold loop\n");
+    std::fprintf(stderr, "none of --ids got RX during the loop\n");
     rc = 1;
   }
   return rc;

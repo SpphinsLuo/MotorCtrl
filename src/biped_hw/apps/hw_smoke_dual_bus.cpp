@@ -126,6 +126,7 @@ int main(int argc, char **argv)
   std::string left_port = biped_hw::kDefaultPortLeft;
   std::string right_port = biped_hw::kDefaultPortRight;
 
+  // ---------------------------------Parse command-line arguments---------------------------------
   for (int i = 1; i < argc; ++i)
   {
     if (std::strcmp(argv[i], "--require-ports") == 0)
@@ -163,7 +164,8 @@ int main(int argc, char **argv)
       return 2;
     }
   }
-
+  // ----------------------------------------------------------------------------------------------
+  
   print_map();
 
   if (sniff_ms > 0)

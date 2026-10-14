@@ -1,7 +1,8 @@
-// biped_hw — p1_left_evo_id8.cpp
+//泉智博电机通信测试程序
 // P1 Motorevo 关：左踝 Roll HA60，仅 CAN 8 / 左 USB2CAN / Master 2。
 // 伺服保持（保守增益），使能 0xFC、失能 0xFD。发送后单独 poll，禁止 send 内 receive。
 // 回包可能走从站 ID 8 或 Master 0x02。不向达妙 CAN 3–7（含 6）发任何命令。
+#include "biped_hw/cli.hpp"
 #include "biped_hw/cycle_logger.hpp"
 #include "biped_hw/frame_demux.hpp"
 #include "biped_hw/motor_map.hpp"
@@ -53,59 +54,15 @@ void atexit_disable()
   g_exit_adapter->sendCan(kEscId, buf, 8);
 }
 
-std::string trim_copy(std::string s)
-{
-  const auto a = s.find_first_not_of(" \t\r\n");
-  if (a == std::string::npos)
-  {
-    return {};
-  }
-  const auto b = s.find_last_not_of(" \t\r\n");
-  return s.substr(a, b - a + 1);
-}
-
 std::string left_port_from_yaml(const std::string &path)
 {
-  std::ifstream in(path);
-  if (!in)
+  std::string left;
+  std::string right;
+  if (!biped_hw::yaml_bus_ports(path, &left, &right))
   {
     return {};
   }
-  std::string line;
-  bool in_left = false;
-  while (std::getline(in, line))
-  {
-    const auto hash = line.find('#');
-    if (hash != std::string::npos)
-    {
-      line = line.substr(0, hash);
-    }
-    const std::string t = trim_copy(line);
-    if (t.empty())
-    {
-      continue;
-    }
-    if (t.find("right:") == 0)
-    {
-      in_left = false;
-      continue;
-    }
-    if (t.find("left:") == 0)
-    {
-      in_left = true;
-      continue;
-    }
-    if (!in_left)
-    {
-      continue;
-    }
-    const auto p = t.find("port:");
-    if (p == 0)
-    {
-      return trim_copy(t.substr(5));
-    }
-  }
-  return {};
+  return left;
 }
 
 struct SessionLog

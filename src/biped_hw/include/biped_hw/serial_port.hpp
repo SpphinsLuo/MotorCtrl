@@ -35,6 +35,8 @@ public:
   bool open();
   void close();
   bool is_open() const { return fd_ >= 0; }
+  int native_fd() const { return fd_; }
+  int timeout_ms() const { return timeout_ms_; }
 
   const std::string &port() const { return port_; }
   const std::string &last_error() const { return last_error_; }
@@ -91,5 +93,8 @@ private:
   std::queue<uint8_t> recv_queue_;
   std::array<uint8_t, 1024> recv_buf_{};
 };
+
+// Kernel tty driver name (e.g. pl2303, cp210x) from /sys. Empty if unknown.
+std::string tty_driver_name(const std::string &port);
 
 }  // namespace biped_hw
