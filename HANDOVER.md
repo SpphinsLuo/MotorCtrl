@@ -6,7 +6,7 @@
 
 **本机硬件：** 双 USB2CAN · 达妙 MIT（多数）+ Motorevo HA60（踝 roll）· MBS 关节编码器 · Wheeltec N100 IMU。算法与驱动同机 onboard mini-PC。
 
-**工作区：** `/home/lanluo/WS/motorctrl`（colcon）。新代码 `src/biped_hw`。旧 `src/motor_ctrl` 只读冻结。旁路包：`src/serial`、`src/wheeltec_n100_imu`。规则：`.cursor/rules/karpathy-guidelines.mdc`、`.cursor/rules/motorctrl.mdc`。
+**工作区：** `/home/ye/00_jfl_26.10/MotorCtrl`（colcon）。新代码 `src/biped_hw`。旧 `src/motor_ctrl` 只读冻结。旁路包：`src/serial`、`src/wheeltec_n100_imu`。规则：`.cursor/rules/karpathy-guidelines.mdc`、`.cursor/rules/motorctrl.mdc`。
 
 ---
 
@@ -14,7 +14,7 @@
 
 ```bash
 source /opt/ros/humble/setup.bash
-source /home/lanluo/WS/motorctrl/install/setup.bash
+source /home/ye/00_jfl_26.10/MotorCtrl/install/setup.bash
 ```
 
 - **Never** `~/WS/install` 或其它 workspace overlay。

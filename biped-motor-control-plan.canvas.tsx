@@ -26,7 +26,7 @@ import {
 
 type PhaseId = "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7";
 
-const HANDOVER_PATH = "/home/lanluo/WS/motorctrl/HANDOVER.md";
+const HANDOVER_PATH = "/home/ye/00_jfl_26.10/MotorCtrl/HANDOVER.md";
 
 const PHASES: Array<{
   id: PhaseId;
@@ -361,7 +361,7 @@ export default function BipedMotorControlPlan() {
             Open HANDOVER.md
           </Button>
           <Text size="small" tone="tertiary">
-            交接原文：`/home/lanluo/WS/motorctrl/HANDOVER.md`
+            交接原文：`/home/ye/00_jfl_26.10/MotorCtrl/HANDOVER.md`
           </Text>
         </Row>
       </Stack>
@@ -566,7 +566,7 @@ export default function BipedMotorControlPlan() {
 
       <Divider />
       <Text size="small" tone="tertiary">
-        Source: `/home/lanluo/WS/motorctrl/HANDOVER.md` · 计划板，无实验曲线。Cursor 打开副本在 canvases/；同内容也放在 HANDOVER 同目录。
+        Source: `/home/ye/00_jfl_26.10/MotorCtrl/HANDOVER.md` · 计划板，无实验曲线。Cursor 打开副本在 canvases/；同内容也放在 HANDOVER 同目录。
       </Text>
     </Stack>
   );

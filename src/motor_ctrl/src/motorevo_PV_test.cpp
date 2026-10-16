@@ -18,7 +18,7 @@ static std::ofstream file;  // 静态变量保持打开状态
 static std::ofstream file1;  // 静态变量保持打开状态
 static std::ofstream file2;  // 静态变量保持打开状态
 static std::ofstream file3;  // 静态变量保持打开状态
-const std::string PIPE_PATH = "/home/rosnoeticf/aaaWs/motorctrltest/ros_sync_pipe";
+const std::string PIPE_PATH = "/home/ye/00_jfl_26.10/MotorCtrl/ros_sync_pipe";
 
 static std::ofstream file_traj;  // 静态变量保持打开状态
 
@@ -220,7 +220,7 @@ void multiTrajGenerator_kneeVersion(std::vector<double>& trajectory, double gain
 void testTraj(){
     std::vector<double> traj;
     multiTrajGenerator_kneeVersion(traj, 10, 5);
-    writeVectorToTxt(traj, "/home/ding/aaaWsLj/data/testTraj922.txt");
+    writeVectorToTxt(traj, "/home/ye/00_jfl_26.10/MotorCtrl/data/testTraj922.txt");
 }
 
 int test01(){
@@ -912,7 +912,7 @@ void dataWriteTime(int canID, float motor_pos, float motor_vel, float motor_tor,
         
         // ros2 lib find package
         // std::string package_path = ament_index_cpp::get_package_share_directory(package_name);
-        std::string save_path = "/home/ding/aaaWsLj/data/motor_ctrl/";
+        std::string save_path = "/home/ye/00_jfl_26.10/MotorCtrl/data/motor_ctrl/";
         std::string file_path = save_path + *filename;
         std::cout << "file_path is "<< file_path << std::endl;
         file.open(file_path, std::ios::app);
@@ -937,7 +937,7 @@ void dataWriteTimewithSendingTime(int canID, float motor_pos, float motor_vel, f
         
         // ros2 lib find package
         // std::string package_path = ament_index_cpp::get_package_share_directory(package_name);
-        std::string save_path = "/home/ding/aaaWsLj/data/motor_ctrl/elmolike_motor/";
+        std::string save_path = "/home/ye/00_jfl_26.10/MotorCtrl/data/motor_ctrl/elmolike_motor/";
         std::string file_path = save_path + *filename;
         std::cout << "file_path is "<< file_path << std::endl;
         file.open(file_path, std::ios::app);
@@ -2397,7 +2397,7 @@ int elmo_pos_traj_ctrl_SDO_2(double posDesMax, int testNum){
     //     0, 1, 2, 3, 4, 5,  // 左腿关节
     //     6, 7, 8, 9, 10, 11  // 右腿关节
     // };
-    // std::vector<TrajectoryPoint> trajectory = loadTrajectory("/home/ding/aaaWsLj/motorctrl/src/motor_ctrl/src/trajectory_data_V3.txt");
+    // std::vector<TrajectoryPoint> trajectory = loadTrajectory("/home/ye/00_jfl_26.10/MotorCtrl/src/motor_ctrl/src/trajectory_data_V3.txt");
     // std::cout<< "traj_knee's all data: " << std::endl;
 
     // for (size_t i = 0; i < trajectory.size(); i++)

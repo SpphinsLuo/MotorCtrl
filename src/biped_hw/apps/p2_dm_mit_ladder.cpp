@@ -120,8 +120,8 @@ struct SessionLog
   bool open()
   {
     std::error_code ec;
-    std::filesystem::create_directories("/home/lanluo/WS/data", ec);
-    std::filesystem::create_directories("/home/lanluo/WS/motorctrl/log", ec);
+    std::filesystem::create_directories("/home/ye/00_jfl_26.10/data", ec);
+    std::filesystem::create_directories("/home/ye/00_jfl_26.10/MotorCtrl/log", ec);
 
     std::time_t now = std::time(nullptr);
     std::tm tm{};
@@ -130,11 +130,11 @@ struct SessionLog
     std::strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tm);
 
     last_fp = std::fopen(last_path.c_str(), "w");
-    stamp_path = std::string("/home/lanluo/WS/data/p2_dm_mit_ladder_") + ts + ".log";
+    stamp_path = std::string("/home/ye/00_jfl_26.10/data/p2_dm_mit_ladder_") + ts + ".log";
     stamp_fp = std::fopen(stamp_path.c_str(), "w");
     if (stamp_fp == nullptr)
     {
-      stamp_path = std::string("/home/lanluo/WS/motorctrl/log/p2_dm_mit_ladder_") + ts + ".log";
+      stamp_path = std::string("/home/ye/00_jfl_26.10/MotorCtrl/log/p2_dm_mit_ladder_") + ts + ".log";
       stamp_fp = std::fopen(stamp_path.c_str(), "w");
     }
     return last_fp != nullptr || stamp_fp != nullptr;

@@ -17,7 +17,7 @@
 
 // 一些全局变量
 // 管道文件路径（固定，供所有程序访问）
-const std::string PIPE_PATH = "/home/rosnoeticf/aaaWs/motorctrltest/ros_sync_pipe";
+const std::string PIPE_PATH = "/home/ye/00_jfl_26.10/MotorCtrl/ros_sync_pipe";
 
 static std::ofstream file[6];  // 静态变量保持打开状态
 

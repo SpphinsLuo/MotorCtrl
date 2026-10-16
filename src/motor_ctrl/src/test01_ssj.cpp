@@ -40,7 +40,7 @@ void dataWriteTimewithSendingTime(int canID, int64_t time, float motor_pos, floa
     
     if (!file_.is_open())
     {
-        std::string save_path = "/home/ding/aaaWsLj/data/motor_ctrl/evo_motor_ctrl_withSendingTime/";
+        std::string save_path = "/home/ye/00_jfl_26.10/MotorCtrl/data/motor_ctrl/evo_motor_ctrl_withSendingTime/";
         std::string file_path = save_path + *filename;
         std::cout << "file_path is "<< file_path << std::endl;
         file_.open(file_path, std::ios::app);

@@ -98,7 +98,7 @@ void testReadTraj(){
         0, 1, 2, 3, 4, 5,  // 左腿关节
         6, 7, 8, 9, 10, 11  // 右腿关节
     };
-    std::vector<TrajectoryPoint> trajectory = loadTrajectory("/home/lanluo/WS/motorctrl/src/motor_ctrl/src/trajectory_data_V3.txt");
+    std::vector<TrajectoryPoint> trajectory = loadTrajectory("/home/ye/00_jfl_26.10/MotorCtrl/src/motor_ctrl/src/trajectory_data_V3.txt");
     for (size_t i = 0; i < trajectory.size(); i++)
     {
         std::cout << trajectory[i].joint_angles[0] << " ";
@@ -115,7 +115,7 @@ void dataWriteTime(int canID,  int64_t time, float motor_pos, float motor_vel, f
     
     if (!file_.is_open())
     {
-        std::string save_path = "/home/lanluo/WS/data/evo_motor_ctrl/";
+        std::string save_path = "/home/ye/00_jfl_26.10/MotorCtrl/data/evo_motor_ctrl/";
         std::string file_path = save_path + *filename;
         std::cout << "file_path is "<< file_path << std::endl;
         file_.open(file_path, std::ios::app);
@@ -135,7 +135,7 @@ void dataWriteTimewithSendingTime(int canID,  int64_t time, float motor_pos, flo
     
     if (!file_.is_open())
     {
-        std::string save_path = "/home/lanluo/WS/data/evo_motor_ctrl_withSendingTime/";
+        std::string save_path = "/home/ye/00_jfl_26.10/MotorCtrl/data/evo_motor_ctrl_withSendingTime/";
         std::string file_path = save_path + *filename;
         std::cout << "file_path is "<< file_path << std::endl;
         file_.open(file_path, std::ios::app);
@@ -164,7 +164,7 @@ void dataWriteHex(int canID,  int64_t time, motor_head::CAN_Receive_Frame& recei
     
     if (!file_.is_open())
     {
-        std::string save_path = "/home/lanluo/WS/data/motor_ctrl/evo_motor_ctrl/";
+        std::string save_path = "/home/ye/00_jfl_26.10/MotorCtrl/data/motor_ctrl/evo_motor_ctrl/";
         std::string file_path = save_path + *filename;
         std::cout << "file_path is "<< file_path << std::endl;
         file_.open(file_path, std::ios::app);
@@ -509,7 +509,7 @@ void multiTrajGenerator_kneeVersion(std::vector<double>& trajectory, double gain
 void testTraj(){
     std::vector<double> traj;
     multiTrajGenerator(traj, 10, 5);
-    writeVectorToTxt(traj, "/home/lanluo/WS/data/testTraj920.txt");
+    writeVectorToTxt(traj, "/home/ye/00_jfl_26.10/MotorCtrl/data/testTraj920.txt");
 }
 
 /**
@@ -544,7 +544,7 @@ int left_leg_hip_pitch_ctrl(int testNum, int targetpos, int date){
     //     0, 1, 2, 3, 4, 5,  // 左腿关节
     //     6, 7, 8, 9, 10, 11  // 右腿关节
     // };
-    // std::vector<TrajectoryPoint> trajectory = loadTrajectory("/home/ding/aaaWsLj/motorctrl/src/motor_ctrl/src/trajectory_data_V3.txt");
+    // std::vector<TrajectoryPoint> trajectory = loadTrajectory("/home/ye/00_jfl_26.10/MotorCtrl/src/motor_ctrl/src/trajectory_data_V3.txt");
     
 
     // 等待输入继续执行
@@ -801,7 +801,7 @@ int left_leg_hip_pitch_ctrl_multiTraj(int testNum, int targetpos, int date){
     //     0, 1, 2, 3, 4, 5,  // 左腿关节
     //     6, 7, 8, 9, 10, 11  // 右腿关节
     // };
-    // std::vector<TrajectoryPoint> trajectory = loadTrajectory("/home/ding/aaaWsLj/motorctrl/src/motor_ctrl/src/trajectory_data_V3.txt");
+    // std::vector<TrajectoryPoint> trajectory = loadTrajectory("/home/ye/00_jfl_26.10/MotorCtrl/src/motor_ctrl/src/trajectory_data_V3.txt");
     
 
     // 等待输入继续执行
@@ -968,7 +968,7 @@ int left_leg_hip_roll_ctrl(int testNum, int targetpos){
         0, 1, 2, 3, 4, 5,  // 左腿关节
         6, 7, 8, 9, 10, 11  // 右腿关节
     };
-    std::vector<TrajectoryPoint> trajectory = loadTrajectory("/home/ding/aaaWsLj/motorctrl/src/motor_ctrl/src/trajectory_data_V3.txt");
+    std::vector<TrajectoryPoint> trajectory = loadTrajectory("/home/ye/00_jfl_26.10/MotorCtrl/src/motor_ctrl/src/trajectory_data_V3.txt");
     
 
     // 等待输入继续执行
@@ -1100,7 +1100,7 @@ int left_leg_hip_roll_ctrl_multiTraj(int testNum, int targetpos, int date){
     // 五次多项式轨迹
     // trajectoryGenerator(trajectory_knee, velocity_knee, targetpos);  // 测试轨迹无问题927
     multiTrajGenerator(trajectory_hip_roll, targetpos, 5);
-    // writeVectorToTxt(trajectory_knee, "/home/ding/aaaWsLj/data/testTraj927_2.txt");  //测试轨迹无问题927
+    // writeVectorToTxt(trajectory_knee, "/home/ye/00_jfl_26.10/MotorCtrl/data/testTraj927_2.txt");  //测试轨迹无问题927
 
     // 等待输入继续执行
     // std::cout << "Press Enter to continue ..."<<std::endl;
@@ -1248,7 +1248,7 @@ int left_leg_hip_yaw_ctrl(int testNum, int targetpos){
         0, 1, 2, 3, 4, 5,  // 左腿关节
         6, 7, 8, 9, 10, 11  // 右腿关节
     };
-    std::vector<TrajectoryPoint> trajectory = loadTrajectory("/home/ding/aaaWsLj/motorctrl/src/motor_ctrl/src/trajectory_data_V3.txt");
+    std::vector<TrajectoryPoint> trajectory = loadTrajectory("/home/ye/00_jfl_26.10/MotorCtrl/src/motor_ctrl/src/trajectory_data_V3.txt");
 
     // 等待输入继续执行
     // std::cout << "Press Enter to continue ..."<<std::endl;
@@ -1428,7 +1428,7 @@ int left_leg_knee_ctrl_multiTraj(int testNum, int targetpos, int date){
     // 五次多项式轨迹
     // trajectoryGenerator(trajectory_knee, velocity_knee, targetpos);  // 测试轨迹无问题927
     multiTrajGenerator_kneeVersion(trajectory_knee, targetpos, 5);
-    // writeVectorToTxt(trajectory_knee, "/home/ding/aaaWsLj/data/testTraj927_2.txt");  //测试轨迹无问题927
+    // writeVectorToTxt(trajectory_knee, "/home/ye/00_jfl_26.10/MotorCtrl/data/testTraj927_2.txt");  //测试轨迹无问题927
 
     // 等待输入继续执行
     // std::cout << "Press Enter to continue ..."<<std::endl;
@@ -1562,7 +1562,7 @@ int left_leg_ankle_ctrl(int testNum, int targetposPitch, int targetposRoll, int 
     //     0, 1, 2, 3, 4, 5,  // 左腿关节
     //     6, 7, 8, 9, 10, 11  // 右腿关节
     // };
-    // std::vector<TrajectoryPoint> trajectory = loadTrajectory("/home/ding/aaaWsLj/motorctrl/src/motor_ctrl/src/trajectory_data_V3.txt");
+    // std::vector<TrajectoryPoint> trajectory = loadTrajectory("/home/ye/00_jfl_26.10/MotorCtrl/src/motor_ctrl/src/trajectory_data_V3.txt");
     
 
     std::string filename_ankle_high = std::to_string(date) + std::string("left_ankle_high_") + std::to_string(testNum) + ".txt";
@@ -1743,7 +1743,7 @@ int left_leg_ankle_ctrl_multiTraj(int testNum, int targetposPitch, int targetpos
     //     0, 1, 2, 3, 4, 5,  // 左腿关节
     //     6, 7, 8, 9, 10, 11  // 右腿关节
     // };
-    // std::vector<TrajectoryPoint> trajectory = loadTrajectory("/home/ding/aaaWsLj/motorctrl/src/motor_ctrl/src/trajectory_data_V3.txt");
+    // std::vector<TrajectoryPoint> trajectory = loadTrajectory("/home/ye/00_jfl_26.10/MotorCtrl/src/motor_ctrl/src/trajectory_data_V3.txt");
     
 
     std::string filename_ankle_high = std::to_string(date) + std::string("left_ankle_high_") + std::to_string(testNum) + ".txt";
@@ -1979,7 +1979,7 @@ int testFinal(int testNum, int date, double* amplitude_joints){
     //     0, 1, 2, 3, 4, 5,  // 左腿关节
     //     6, 7, 8, 9, 10, 11  // 右腿关节
     // };
-    // std::vector<TrajectoryPoint> trajectory = loadTrajectory("/home/ding/aaaWsLj/motorctrl/src/motor_ctrl/src/trajectory_data_V3.txt");
+    // std::vector<TrajectoryPoint> trajectory = loadTrajectory("/home/ye/00_jfl_26.10/MotorCtrl/src/motor_ctrl/src/trajectory_data_V3.txt");
 
     dm.disable(motors[0]);
     dm.disable(motors[1]);
@@ -2253,7 +2253,7 @@ int final_ctrl_multi(int testNum, int date, double* amplitude_joints){
     //     0, 1, 2, 3, 4, 5,  // 左腿关节
     //     6, 7, 8, 9, 10, 11  // 右腿关节
     // };
-    // std::vector<TrajectoryPoint> trajectory = loadTrajectory("/home/ding/aaaWsLj/motorctrl/src/motor_ctrl/src/trajectory_data_V3.txt");
+    // std::vector<TrajectoryPoint> trajectory = loadTrajectory("/home/ye/00_jfl_26.10/MotorCtrl/src/motor_ctrl/src/trajectory_data_V3.txt");
 
     dm.disable(motors[0]);
     dm.disable(motors[1]);
@@ -2309,12 +2309,12 @@ int final_ctrl_multi(int testNum, int date, double* amplitude_joints){
     multiTrajGenerator(trajectory_ankle_H, ankleMotorH, 5);
     multiTrajGenerator(trajectory_ankle_L, ankleMotorL, 5);
 
-    // writeVectorToTxt(trajectory_hip_pitch, "/home/ding/aaaWsLj/data/testTraj928_1.txt");
-    // writeVectorToTxt(trajectory_hip_roll, "/home/ding/aaaWsLj/data/testTraj928_2.txt");
-    // writeVectorToTxt(trajectory_hip_yaw, "/home/ding/aaaWsLj/data/testTraj928_3.txt");
-    // writeVectorToTxt(trajectory_knee, "/home/ding/aaaWsLj/data/testTraj928_4.txt");
-    // writeVectorToTxt(trajectory_ankle_H, "/home/ding/aaaWsLj/data/testTraj928_5.txt");
-    // writeVectorToTxt(trajectory_ankle_L, "/home/ding/aaaWsLj/data/testTraj928_6.txt");
+    // writeVectorToTxt(trajectory_hip_pitch, "/home/ye/00_jfl_26.10/MotorCtrl/data/testTraj928_1.txt");
+    // writeVectorToTxt(trajectory_hip_roll, "/home/ye/00_jfl_26.10/MotorCtrl/data/testTraj928_2.txt");
+    // writeVectorToTxt(trajectory_hip_yaw, "/home/ye/00_jfl_26.10/MotorCtrl/data/testTraj928_3.txt");
+    // writeVectorToTxt(trajectory_knee, "/home/ye/00_jfl_26.10/MotorCtrl/data/testTraj928_4.txt");
+    // writeVectorToTxt(trajectory_ankle_H, "/home/ye/00_jfl_26.10/MotorCtrl/data/testTraj928_5.txt");
+    // writeVectorToTxt(trajectory_ankle_L, "/home/ye/00_jfl_26.10/MotorCtrl/data/testTraj928_6.txt");
 
 
     // trajectoryGenerator(trajectory_hip_pitch, velocity_hip_pitch, amplitude_joints[0]);
@@ -2675,7 +2675,7 @@ int final_ctrl_multi_right(int testNum, int date, double* amplitude_joints){
     //     0, 1, 2, 3, 4, 5,  // 左腿关节
     //     6, 7, 8, 9, 10, 11  // 右腿关节
     // };
-    // std::vector<TrajectoryPoint> trajectory = loadTrajectory("/home/ding/aaaWsLj/motorctrl/src/motor_ctrl/src/trajectory_data_V3.txt");
+    // std::vector<TrajectoryPoint> trajectory = loadTrajectory("/home/ye/00_jfl_26.10/MotorCtrl/src/motor_ctrl/src/trajectory_data_V3.txt");
 
     for (size_t i = 0; i < 6; i++)
     {
@@ -2728,12 +2728,12 @@ int final_ctrl_multi_right(int testNum, int date, double* amplitude_joints){
     multiTrajGenerator(trajectory_ankle_H, ankleMotorH, 5);
     multiTrajGenerator(trajectory_ankle_L, ankleMotorL, 5);
 
-    // writeVectorToTxt(trajectory_hip_pitch, "/home/ding/aaaWsLj/data/testTraj928_1.txt");
-    // writeVectorToTxt(trajectory_hip_roll, "/home/ding/aaaWsLj/data/testTraj928_2.txt");
-    // writeVectorToTxt(trajectory_hip_yaw, "/home/ding/aaaWsLj/data/testTraj928_3.txt");
-    // writeVectorToTxt(trajectory_knee, "/home/ding/aaaWsLj/data/testTraj928_4.txt");
-    // writeVectorToTxt(trajectory_ankle_H, "/home/ding/aaaWsLj/data/testTraj928_5.txt");
-    // writeVectorToTxt(trajectory_ankle_L, "/home/ding/aaaWsLj/data/testTraj928_6.txt");
+    // writeVectorToTxt(trajectory_hip_pitch, "/home/ye/00_jfl_26.10/MotorCtrl/data/testTraj928_1.txt");
+    // writeVectorToTxt(trajectory_hip_roll, "/home/ye/00_jfl_26.10/MotorCtrl/data/testTraj928_2.txt");
+    // writeVectorToTxt(trajectory_hip_yaw, "/home/ye/00_jfl_26.10/MotorCtrl/data/testTraj928_3.txt");
+    // writeVectorToTxt(trajectory_knee, "/home/ye/00_jfl_26.10/MotorCtrl/data/testTraj928_4.txt");
+    // writeVectorToTxt(trajectory_ankle_H, "/home/ye/00_jfl_26.10/MotorCtrl/data/testTraj928_5.txt");
+    // writeVectorToTxt(trajectory_ankle_L, "/home/ye/00_jfl_26.10/MotorCtrl/data/testTraj928_6.txt");
 
 
     // trajectoryGenerator(trajectory_hip_pitch, velocity_hip_pitch, amplitude_joints[0]);
@@ -3098,7 +3098,7 @@ int newDou_test_multiTraj(int testNum, int targetpos, int date){
     //     0, 1, 2, 3, 4, 5,  // 左腿关节
     //     6, 7, 8, 9, 10, 11  // 右腿关节
     // };
-    // std::vector<TrajectoryPoint> trajectory = loadTrajectory("/home/ding/aaaWsLj/motorctrl/src/motor_ctrl/src/trajectory_data_V3.txt");
+    // std::vector<TrajectoryPoint> trajectory = loadTrajectory("/home/ye/00_jfl_26.10/MotorCtrl/src/motor_ctrl/src/trajectory_data_V3.txt");
     
 
     // 等待输入继续执行
