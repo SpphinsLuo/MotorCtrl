@@ -33,9 +33,9 @@ float q_hard_for(uint8_t)
   return kSafetyQHardRad;
 }
 
-float tau_hard_for(uint8_t)
+float tau_hard_for(uint8_t can_id)
 {
-  return kSafetyTauHardNm;
+  return peak_tau_nm(can_id);
 }
 
 SafetyLimitHit classify_abs(float mag, float soft, float hard)
@@ -77,6 +77,8 @@ const char *to_string(SafetyReason reason)
     return "drop";
   case SafetyReason::RidFail:
     return "rid";
+  case SafetyReason::CommunicationTimeout:
+    return "comm_timeout";
   }
   return "?";
 }
@@ -171,6 +173,12 @@ bool safety_note_rx(SafetyDropWatch &w, uint8_t can_id, bool rx_ok)
     ++w.streak[slot];
   }
   return w.streak[slot] >= static_cast<uint8_t>(kSafetyDropStreak);
+}
+
+bool safety_communication_timeout(double elapsed_ms, double period_ms)
+{
+  return std::isfinite(elapsed_ms) && std::isfinite(period_ms) && period_ms > 0.0 &&
+         elapsed_ms > period_ms;
 }
 
 void safety_estop_trip()
@@ -376,8 +384,13 @@ int safety_self_test()
   {
     return 3;
   }
-  if (safety_check_tau(6, 15.f) != SafetyLimitHit::Ok ||
-      safety_check_tau(6, 15.1f) != SafetyLimitHit::Hard)
+  const float t6 = peak_tau_nm(static_cast<uint8_t>(6));
+  const float t8 = peak_tau_nm(static_cast<uint8_t>(8));
+  if (t6 < 1.f || t8 < 1.f ||
+      safety_check_tau(6, t6) != SafetyLimitHit::Ok ||
+      safety_check_tau(6, t6 + 0.1f) != SafetyLimitHit::Hard ||
+      safety_check_tau(8, t8) != SafetyLimitHit::Ok ||
+      safety_check_tau(8, t8 + 0.1f) != SafetyLimitHit::Hard)
   {
     return 4;
   }
@@ -452,6 +465,12 @@ int safety_self_test()
     return 9;
   }
   if (!safety_note_rx(drops, 6, false))
+  {
+    return 9;
+  }
+  if (safety_communication_timeout(10.001, 10.0) == false ||
+      safety_communication_timeout(10.0, 10.0) ||
+      safety_communication_timeout(9.999, 10.0))
   {
     return 9;
   }

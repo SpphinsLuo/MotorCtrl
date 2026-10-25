@@ -1,8 +1,7 @@
 // biped_hw — dm_mit_host.hpp
-// Damiao host helpers: 0xFC/0xFD/0xFE, RID 21/22/23, CTRL_MODE MIT/POS_VEL/VEL/POS_FORCE,
-// hold / host dq / home-to-zero (MIT host-dq toward 0, not 0xFE). Functions only — not a class
-// hierarchy. Apps keep test motion profiles. MIT remains the default enable path
-// (dm_enable_mit). Evo analog lives here because it shares sendCan.
+// Damiao / Motorevo host helpers. Control mode, 0xFC/0xFD/0xFE, and home-to-zero
+// live here — P2 apps only choose the default (DM=MIT, HA60=servo) and the test
+// profile. Home is MIT host-dq / evo servo toward firmware 0, not 0xFE.
 #pragma once
 
 #include "biped_hw/dm_codec.hpp"
@@ -30,6 +29,7 @@ inline constexpr float kDmHomeTimeoutMaxS = 30.f;
 inline constexpr float kDmHomeVel = 1.f;            // rad/s default
 inline constexpr float kDmHomeVelMax = 3.f;
 inline constexpr float kDmHomeKd = 2.f;             // host-dq damping; stall ~ kd*vel
+inline constexpr float kDmHomeTauFf = 10.f;         // MIT t_ff toward 0 (same sign as dq_des)
 inline constexpr int kDmHomePeriodMs = 10;
 inline constexpr float kEvoHomeKp = 8.f;  // p2_evo pos default
 inline constexpr float kEvoHomeKd = 0.5f;
@@ -50,13 +50,6 @@ struct DmXactHook
 struct DmMitEnableStatus
 {
   LimitParam lim{};
-  float pmax = 0.f;
-  float vmax = 0.f;
-  float tmax = 0.f;
-  bool pmax_ok = false;
-  bool vmax_ok = false;
-  bool tmax_ok = false;
-  bool rid_ok = false;
   bool ctrl_before_ok = false;
   bool wrote_ack = false;
   bool ctrl_after_ok = false;
@@ -78,6 +71,16 @@ bool dm_send_enable(UsbCanAdapter &ad, uint8_t id);
 // Writes firmware zero (current pos). MIT 0xFE. Does not enable. True if TX ok.
 bool dm_send_set_zero(UsbCanAdapter &ad, uint8_t id);
 
+void evo_send_disable(UsbCanAdapter &ad, uint8_t id);
+bool evo_send_enable(UsbCanAdapter &ad, uint8_t id);
+// Official: 0xFD → 0xFC → SetzeroPosition FF×7+FE on MotorID, then §6.9.9
+// SaveFlash on 0x600+ID (67 00 … 15 76). Needs 2024.9.25+ firmware.
+bool evo_send_set_zero(UsbCanAdapter &ad, uint8_t id);
+bool evo_send_set_zero(UsbCanAdapter &ad, uint8_t id, FrameDemux *dm, float *q_before,
+                       float *q_after);
+// Disable then 0xFC. Firmware servo is the default after enable (no RID CTRL_MODE).
+bool evo_enable_servo(UsbCanAdapter &ad, uint8_t id);
+
 bool dm_wait_register(UsbCanAdapter &ad, FrameDemux &dm, uint8_t esc_id, uint8_t rid,
                       DmRegisterReply &reply, int timeout_ms, const DmXactHook *hook = nullptr);
 bool dm_read_rid(UsbCanAdapter &ad, FrameDemux &dm, uint8_t esc_id, uint8_t rid, float &value,
@@ -85,19 +88,16 @@ bool dm_read_rid(UsbCanAdapter &ad, FrameDemux &dm, uint8_t esc_id, uint8_t rid,
 bool dm_write_rid_u32(UsbCanAdapter &ad, FrameDemux &dm, uint8_t esc_id, uint8_t rid,
                       uint32_t value, const DmXactHook *hook = nullptr);
 
-bool dm_read_pvt_limits(UsbCanAdapter &ad, FrameDemux &dm, uint8_t esc_id, LimitParam &lim,
-                        DmMitEnableStatus *st = nullptr, const DmXactHook *hook = nullptr);
 bool dm_set_ctrl_mode(UsbCanAdapter &ad, FrameDemux &dm, uint8_t esc_id, uint32_t mode,
                       DmMitEnableStatus &st, const DmXactHook *hook = nullptr);
 bool dm_set_ctrl_mode_mit(UsbCanAdapter &ad, FrameDemux &dm, uint8_t esc_id,
                           DmMitEnableStatus &st, const DmXactHook *hook = nullptr);
 
-// require_pvt: knee/DM10422 path — refuse enable if RID 21/22/23 fail.
 // Disable, write CTRL_MODE, verify, then 0xFC. Damiao needs disable before mode change.
+// MIT pack range is default_limit(model), not firmware RID 21/22/23.
 DmMitEnableErr dm_enable_mode(UsbCanAdapter &ad, FrameDemux &dm, uint8_t id, uint32_t mode,
-                              bool require_pvt, DmMitEnableStatus &st,
-                              const DmXactHook *hook = nullptr);
-DmMitEnableErr dm_enable_mit(UsbCanAdapter &ad, FrameDemux &dm, uint8_t id, bool require_pvt,
+                              DmMitEnableStatus &st, const DmXactHook *hook = nullptr);
+DmMitEnableErr dm_enable_mit(UsbCanAdapter &ad, FrameDemux &dm, uint8_t id,
                              DmMitEnableStatus &st, const DmXactHook *hook = nullptr);
 
 bool dm_probe_q0(UsbCanAdapter &ad, FrameDemux &dm, uint8_t id, const LimitParam &lim, float &q0,
@@ -148,7 +148,8 @@ inline const char *dm_home_result_name(DmHomeResult r)
 }
 
 // After 0xFC. Probe q (not 0xFE). If |q|>eps, MIT host-dq toward 0: kp=0,
-// kd=home_kd, dq_des=-sign(q)*home_vel, q_des=0, tau_ff=0 until |q|<=eps,
+// kd=home_kd, dq_des=-sign(q)*home_vel, q_des=0, tau_ff=-sign(q)*kDmHomeTauFf
+// until |q|<=eps,
 // timeout, or |tau|>abort_tau. Timeout = max(timeout_s, |q|/min(vel,1)+slack)
 // capped at kDmHomeTimeoutMaxS (plant may track slower than commanded vel).
 // Does not 0xFD.

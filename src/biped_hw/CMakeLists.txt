@@ -1,6 +1,6 @@
 # biped_hw — CMakeLists.txt
 # ament/CMake 构建：共享库 + P0 冒烟、P1 达妙/Motorevo 使能、
-# P2 达妙 MIT/POS_VEL/VEL/POS_FORCE 阶梯 / Motorevo 伺服跟踪、P3 同周期同步 / 双膝慢摆、
+# P2 达妙/Motorevo 单电机测试（默认 MIT / servo）、P3 同周期同步、
 # MBS RS485 编码器接收 mbs_encoder_recv、P4 p4_state_dump / p4_hip_kin_self_test、P5 p5_safety_self_test、P6 p6_traj_track，并安装 config/udev。
 cmake_minimum_required(VERSION 3.8)
 project(biped_hw)
@@ -38,23 +38,17 @@ target_link_libraries(${PROJECT_NAME} PUBLIC Threads::Threads)
 add_executable(hw_smoke_dual_bus apps/hw_smoke_dual_bus.cpp)
 target_link_libraries(hw_smoke_dual_bus ${PROJECT_NAME})
 
-# Same source, two defaults: id6 is the P1 first-gate (left knee DM10422).
-add_executable(p1_left_dm_id3 apps/p1_left_dm_id3.cpp)
-target_link_libraries(p1_left_dm_id3 ${PROJECT_NAME})
-target_compile_definitions(p1_left_dm_id3 PRIVATE P1_DEFAULT_CAN_ID=3)
+add_executable(p1_dm_communicate apps/p1_dm_communicate.cpp)
+target_link_libraries(p1_dm_communicate ${PROJECT_NAME})
 
-add_executable(p1_left_dm_id6 apps/p1_left_dm_id3.cpp)
-target_link_libraries(p1_left_dm_id6 ${PROJECT_NAME})
-target_compile_definitions(p1_left_dm_id6 PRIVATE P1_DEFAULT_CAN_ID=6)
+add_executable(p1_evo_communicate apps/p1_evo_communicate.cpp)
+target_link_libraries(p1_evo_communicate ${PROJECT_NAME})
 
-add_executable(p1_left_evo_id8 apps/p1_left_evo_id8.cpp)
-target_link_libraries(p1_left_evo_id8 ${PROJECT_NAME})
+add_executable(p2_dm_test apps/p2_dm_test.cpp)
+target_link_libraries(p2_dm_test ${PROJECT_NAME})
 
-add_executable(p2_dm_mit_ladder apps/p2_dm_mit_ladder.cpp)
-target_link_libraries(p2_dm_mit_ladder ${PROJECT_NAME})
-
-add_executable(p2_evo_servo_track apps/p2_evo_servo_track.cpp)
-target_link_libraries(p2_evo_servo_track ${PROJECT_NAME})
+add_executable(p2_evo_test apps/p2_evo_test.cpp)
+target_link_libraries(p2_evo_test ${PROJECT_NAME})
 
 add_executable(p3_right6_sync apps/p3_right6_sync.cpp)
 target_link_libraries(p3_right6_sync ${PROJECT_NAME})
@@ -64,9 +58,6 @@ target_link_libraries(p3_dual12_sync ${PROJECT_NAME})
 
 add_executable(p3_fault_inject apps/p3_fault_inject.cpp)
 target_link_libraries(p3_fault_inject ${PROJECT_NAME})
-
-add_executable(p3_dual_knee_spin apps/p3_dual_knee_spin.cpp)
-target_link_libraries(p3_dual_knee_spin ${PROJECT_NAME})
 
 add_executable(mbs_encoder_recv apps/mbs_encoder_recv.cpp)
 target_link_libraries(mbs_encoder_recv ${PROJECT_NAME})
@@ -98,9 +89,9 @@ install(TARGETS ${PROJECT_NAME}
   RUNTIME DESTINATION bin
 )
 
-install(TARGETS hw_smoke_dual_bus p1_left_dm_id3 p1_left_dm_id6 p1_left_evo_id8
-        p2_dm_mit_ladder p2_evo_servo_track p3_right6_sync p3_dual12_sync
-        p3_fault_inject p3_dual_knee_spin mbs_encoder_recv p4_state_dump p4_hip_kin_self_test
+install(TARGETS hw_smoke_dual_bus p1_dm_communicate p1_evo_communicate
+        p2_dm_test p2_evo_test p3_right6_sync p3_dual12_sync
+        p3_fault_inject mbs_encoder_recv p4_state_dump p4_hip_kin_self_test
         p5_safety_self_test p6_traj_track
   DESTINATION lib/${PROJECT_NAME}
 )

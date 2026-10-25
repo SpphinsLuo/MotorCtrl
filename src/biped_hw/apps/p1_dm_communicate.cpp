@@ -1,5 +1,5 @@
 // 达妙电机通信测试程序
-// P1 第一关：单电机使能/失能与 RID 限幅读取。同源编成 p1_left_dm_id6（左膝 CAN 6）与 p1_left_dm_id3（髋偏航 CAN 3）。
+// P1：单电机通信/使能/失能与 RID。CAN ID = kCanId，改完重新编译；无 --can-id。
 #include "biped_hw/cli.hpp"
 #include "biped_hw/cycle_logger.hpp"
 #include "biped_hw/dm_codec.hpp"
@@ -18,25 +18,16 @@
 #include <string>
 #include <unistd.h>
 
-#ifndef P1_DEFAULT_CAN_ID
-#define P1_DEFAULT_CAN_ID 6
-#endif
-#if P1_DEFAULT_CAN_ID == 6
-#define P1_BIN_NAME "p1_left_dm_id6"
-#else
-#define P1_BIN_NAME "p1_left_dm_id3"
-#endif
-
 namespace
 {
 
-// Built as p1_left_dm_id6 (primary, left knee DM10422 CAN 6) and p1_left_dm_id3 (left hip yaw DM10010L CAN 3). --can-id remains overridable.
-constexpr uint8_t kDefaultEscId = static_cast<uint8_t>(P1_DEFAULT_CAN_ID);
+// Edit kCanId and rebuild. Must be mapped Damiao MIT, Master 2.
+constexpr uint8_t kCanId = 6;
 constexpr int kEnableSettleUs = 100000;
 constexpr int kDisableGapUs = 10000;
 
 std::atomic<bool> g_run{true};//程序运行标志位
-std::atomic<uint8_t> g_esc_id{kDefaultEscId};
+std::atomic<uint8_t> g_esc_id{kCanId};
 biped_hw::UsbCanAdapter *g_exit_adapter = nullptr;
 
 //程序退出时的信号处理函数  
@@ -71,47 +62,25 @@ bool needs_live_limits(biped_hw::MotorType type)
   return type == biped_hw::MotorType::DM10422;
 }
 
-bool parse_force_limits(const char *s, biped_hw::LimitParam &out)
-{
-  float p = 0.f;
-  float v = 0.f;
-  float t = 0.f;
-  if (s == nullptr || std::sscanf(s, "%f ,%f ,%f", &p, &v, &t) != 3)
-  {
-    return false;
-  }
-  if (p <= 0.1f || v <= 0.1f || t <= 0.1f)
-  {
-    return false;
-  }
-  out.q_max = p;
-  out.dq_max = v;
-  out.tau_max = t;
-  return true;
-}
-
 void usage()
 {
   std::printf(
-      "Usage: %s [--duration SEC] [--kp K] [--kd D] [--period-ms MS]\n"
-      "                      [--can-id N] [--port PATH] [--yaml PATH] [--handshake]\n"
-      "                      [--read-limits] [--force-limits PMAX,VMAX,TMAX]\n"
+      "Usage: p1_dm_communicate [--duration SEC] [--kp K] [--kd D] [--period-ms MS]\n"
+      "                      [--port PATH] [--yaml PATH] [--handshake]\n"
       "                      [--self-test] [--verbose]\n"
-      "Left USB-CAN only. Default CAN ID %u from the compile-time map.\n"
-      "Primary P1 gate: p1_left_dm_id6 = left knee DM10422 CAN 6, Master 2.\n"
-      "Hip yaw stay-behind: p1_left_dm_id3 = left DM10010L CAN 3 (--can-id 3).\n"
+      "CAN ID is kCanId=%u in this file (edit and rebuild). No --can-id.\n"
+      "Must be mapped Damiao MIT, Master 2. Default port is left USB-CAN.\n"
       "Replies on Master CAN ID 2; demux by ESC_ID nibble (not RX canId).\n"
-      "DM10422 table default is {12.5, 20, 400}; RID 21/22/23 overrides when read.\n"
-      "Knee enable still requires RID 21/22/23, or pass --force-limits.\n"
+      "MIT pack range is the types.hpp table (DM10422 {12.5, 20, 400}).\n"
       "Low-kp MIT hold, tau=0. Knee default kp=1. Motor may twitch. Disable on exit.\n"
-      "Never opens the right adapter. Never commands Motorevo ID 8.\n",
-      P1_BIN_NAME, static_cast<unsigned>(kDefaultEscId));
+      "Never opens the right adapter. Never commands Motorevo HA60.\n",
+      static_cast<unsigned>(kCanId));
 }
 
 struct DisableGuard
 {
   biped_hw::UsbCanAdapter *adapter = nullptr;
-  uint8_t can_id = kDefaultEscId;
+  uint8_t can_id = kCanId;
   bool armed = false;
 
   void arm(biped_hw::UsbCanAdapter &a, uint8_t id)
@@ -146,16 +115,13 @@ int main(int argc, char **argv)
   bool kp_set = false;
   bool kd_set = false;
   int period_ms = 10;//通信周期/100Hz
-  uint8_t esc_id = kDefaultEscId;
+  uint8_t esc_id = kCanId;
   std::string port = biped_hw::kDefaultPortLeft;
   std::string yaml_path;
   bool handshake = false;
-  bool read_limits = false;
   bool self_test = false;
   bool verbose = false;
   bool port_set = false;
-  bool have_force_limits = false;
-  biped_hw::LimitParam force_lim{};
 
   // ---------------------------------Parse command-line arguments---------------------------------
   for (int i = 1; i < argc; ++i)
@@ -208,18 +174,8 @@ int main(int argc, char **argv)
     }
     else if (std::strcmp(argv[i], "--can-id") == 0)
     {
-      const char *v = need("--can-id");
-      if (v == nullptr)
-      {
-        return 2;
-      }
-      const int id = std::atoi(v);
-      if (id < 0 || id > 255)
-      {
-        std::fprintf(stderr, "--can-id out of range\n");
-        return 2;
-      }
-      esc_id = static_cast<uint8_t>(id);
+      std::fprintf(stderr, "removed: edit kCanId in p1_dm_communicate.cpp and rebuild\n");
+      return 2;
     }
     else if (std::strcmp(argv[i], "--port") == 0)
     {
@@ -243,25 +199,6 @@ int main(int argc, char **argv)
     else if (std::strcmp(argv[i], "--handshake") == 0)
     {
       handshake = true;
-    }
-    else if (std::strcmp(argv[i], "--read-limits") == 0)
-    {
-      read_limits = true;
-    }
-    else if (std::strcmp(argv[i], "--force-limits") == 0)
-    {
-      const char *v = need("--force-limits");
-      if (v == nullptr)
-      {
-        return 2;
-      }
-      if (!parse_force_limits(v, force_lim))
-      {
-        std::fprintf(stderr,
-                     "--force-limits needs PMAX,VMAX,TMAX (all > 0.1)\n");
-        return 2;
-      }
-      have_force_limits = true;
     }
     else if (std::strcmp(argv[i], "--self-test") == 0)
     {
@@ -297,18 +234,14 @@ int main(int argc, char **argv)
   }
 
   const auto *entry = biped_hw::find_by_can_id(esc_id);
-  if (entry == nullptr || entry->bus != biped_hw::BusId::Left ||
-      entry->master_id != biped_hw::kMasterId || !biped_hw::is_damiao_mit(entry->model))
+  if (entry == nullptr || entry->master_id != biped_hw::kMasterId ||
+      !biped_hw::is_damiao_mit(entry->model))
   {
     std::fprintf(stderr,
-                 "motor map mismatch for CAN ID %u (need left-bus Damiao MIT, Master 2)\n",
+                 "motor map mismatch for CAN ID %u (need mapped Damiao MIT, Master 2)\n",
                  static_cast<unsigned>(esc_id));
     return 1;
   }
-
-#if P1_DEFAULT_CAN_ID == 3
-  std::printf("Note: knee P1 first-gate is p1_left_dm_id6 (DM10422 CAN 6).\n");
-#endif
 
   if (!yaml_path.empty() && !port_set)
   {
@@ -408,78 +341,11 @@ int main(int argc, char **argv)
   }
   // ----------------------------------------------------------------------------------------------
 
-  biped_hw::LimitParam lim{};
-  const char *lim_src = "unset";
+  biped_hw::LimitParam lim = biped_hw::default_limit(entry->model);
   biped_hw::FrameDemux demux;
-
-  float pmax = 0.f, vmax = 0.f, tmax = 0.f;
-  bool pok = false, vok = false, tok = false;
-  // ---------------------------------读取电机限幅参数---------------------------------------------
-  if (knee || read_limits)
-  {
-    adapter.drain();
-    pok = biped_hw::dm_read_rid(adapter, demux, esc_id,
-                           static_cast<uint8_t>(biped_hw::DmRid::Pmax), pmax);
-    vok = biped_hw::dm_read_rid(adapter, demux, esc_id,
-                           static_cast<uint8_t>(biped_hw::DmRid::Vmax), vmax);
-    tok = biped_hw::dm_read_rid(adapter, demux, esc_id,
-                           static_cast<uint8_t>(biped_hw::DmRid::Tmax), tmax);
-    std::printf("RID 21/22/23 PMAX=%s%.4f VMAX=%s%.4f TMAX=%s%.4f\n", pok ? "" : "FAIL ",
-                static_cast<double>(pmax), vok ? "" : "FAIL ",
-                static_cast<double>(vmax), tok ? "" : "FAIL ",
-                static_cast<double>(tmax));
-  }
-
-  const bool rid_ok = pok && vok && tok && pmax > 0.1f && vmax > 0.1f && tmax > 0.1f;
-  if (rid_ok)
-  {
-    lim.q_max = pmax;
-    lim.dq_max = vmax;
-    lim.tau_max = tmax;
-    lim_src = "RID 21/22/23";
-  }
-  else if (knee && have_force_limits)
-  {
-    lim = force_lim;
-    lim_src = "--force-limits";
-    std::printf(
-        "WARN: RID 21/22/23 incomplete; using --force-limits (not a guessed table).\n");
-  }
-  else if (knee)
-  {
-    std::fprintf(stderr,
-                 "REFUSE enable: knee DM10422 CAN %u limits UNVERIFIED and RID 21/22/23 "
-                 "read failed.\n"
-                 "Do not pack MIT with DM10010 {12.5,20,200}; table default is {12.5,20,400}.\n"
-                 "Retry on a live bus, or pass --force-limits PMAX,VMAX,TMAX from the motor.\n",
-                 static_cast<unsigned>(esc_id));
-    return 1;
-  }
-  else
-  {
-    lim = biped_hw::default_limit(entry->model);
-    lim_src = "table default";
-    if (pok && pmax > 0.1f)
-    {
-      lim.q_max = pmax;
-    }
-    if (vok && vmax > 0.1f)
-    {
-      lim.dq_max = vmax;
-    }
-    if (tok && tmax > 0.1f)
-    {
-      lim.tau_max = tmax;
-    }
-    if (pok || vok || tok)
-    {
-      lim_src = "table default + RID overlay";
-    }
-  }
-
-  std::printf("MIT pack/unpack limits: PMAX=%.4f VMAX=%.4f TMAX=%.4f  source=%s\n",
+  std::printf("MIT pack/unpack limits: PMAX=%.4f VMAX=%.4f TMAX=%.4f  source=table\n",
               static_cast<double>(lim.q_max), static_cast<double>(lim.dq_max),
-              static_cast<double>(lim.tau_max), lim_src);
+              static_cast<double>(lim.tau_max));
 
   uint8_t cmd[8] = {};
   if (!biped_hw::dm_send_enable(adapter, esc_id))

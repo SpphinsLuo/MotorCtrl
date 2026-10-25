@@ -1,9 +1,9 @@
 // biped_hw — p3_runtime.cpp
-// P3 运行时：探测在线 ID、低 kp hold 或 triangle 绕 q0、write-all/drain-all。
-// 默认只使能 --ids（通常为 6）；--ids 含 HA60 时纳入伺服。退出走 P5 disable-all。
+// P3 运行时：探测在线 ID、低 kp hold 或 sine 绕 q0、write-all/drain-all。
+// 只使能 --ids（dual12 默认 3–14；right6 默认 9–14；其余默认 6）。退出走 P5 disable-all。
 // --comms-only 不发 0xFC：RID + MIT kp=0 / HA60 evo inquire，然后 0xFD。
-// --stage triangle 不调用 dm_home_to_zero：q_des 在探测 q0±stroke 反向。
-// --set-zero：选中 --ids 写固件零点（0xFE），不发 0xFC，不与 --stage 并用，然后 0xFD。
+// --stage sine 不调用 dm_home_to_zero：q_des 绕探测 q0 正弦运动。
+// --set-zero：选中 --ids 写固件零点（官方 0xFE），不与 --stage 并用，然后 0xFD。
 #include "biped_hw/p3_runtime.hpp"
 
 #include "biped_hw/bus_cycle.hpp"
@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <string>
 #include <unistd.h>
 #include <unordered_set>
 
@@ -37,8 +38,8 @@ namespace
 
 constexpr int kEnableSettleUs = 100000;
 constexpr int kDisableGapUs = 10000;
-constexpr float kKpCap = 20.f;
-constexpr float kKdCap = 1.f;
+constexpr float kKpCap = kMitKpMax;
+constexpr float kKdCap = kMitKdMax;
 constexpr int kProbeTicks = 3;
 // P2 HA60 conservative servo hold (vel_kp=0 cannot track/hold θ_ref).
 constexpr float kHa60HoldPosKp = 8.f;
@@ -50,7 +51,6 @@ constexpr float kHa60HoldVelKi = 0.001f;
 constexpr float kVelDefault = 0.20f;
 constexpr float kVelCap = 0.30f;
 constexpr float kStrokeDefault = 0.349f;  // ±20 deg
-constexpr float kAbortTauDefault = 15.f;
 constexpr float kAbortQMargin = 0.10f;
 
 std::atomic<bool> g_run{true};
@@ -78,11 +78,6 @@ void disable_all_now(bool print)
 void atexit_disable()
 {
   safety_atexit_disable();
-}
-
-bool is_damiao(MotorType t)
-{
-  return is_damiao_mit(t);
 }
 
 bool contains_id(const std::vector<uint8_t> &ids, uint8_t id)
@@ -125,26 +120,6 @@ bool parse_csv_u8(const char *s, std::vector<uint8_t> &out)
   return !out.empty();
 }
 
-
-bool parse_bool_flag(const char *v, bool &out)
-{
-  if (v == nullptr)
-  {
-    out = true;
-    return true;
-  }
-  if (std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 || std::strcmp(v, "yes") == 0)
-  {
-    out = true;
-    return true;
-  }
-  if (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0 || std::strcmp(v, "no") == 0)
-  {
-    out = false;
-    return true;
-  }
-  return false;
-}
 
 UsbCanAdapter *adapter_for(uint8_t can_id)
 {
@@ -233,31 +208,6 @@ FrameDemux *demux_for(uint8_t can_id, FrameDemux &left, FrameDemux &right)
 }
 
 
-std::vector<uint8_t> expected_ids(BusId bus, bool skip_motorevo)
-{
-  std::vector<uint8_t> ids;
-  for (const auto &e : kMotorMap)
-  {
-    if (e.bus != bus)
-    {
-      continue;
-    }
-    if (e.model == MotorType::HA60 && skip_motorevo)
-    {
-      continue;
-    }
-    if (e.model == MotorType::HA60)
-    {
-      continue;  // Motorevo only if later added to enable set
-    }
-    if (is_damiao(e.model))
-    {
-      ids.push_back(e.can_id);
-    }
-  }
-  return ids;
-}
-
 void add_unique(std::vector<uint8_t> &ids, uint8_t id)
 {
   if (!contains_id(ids, id))
@@ -281,7 +231,7 @@ struct IdStats
   float last_tau = 0.f;
   float q0 = 0.f;
   float q_des = 0.f;
-  float vel_sign = 1.f;
+  float dq_des = 0.f;
   float q_min = 0.f;
   float q_max = 0.f;
   float q_peak_abs = 0.f;
@@ -377,8 +327,8 @@ void accumulate(std::vector<IdStats> &st, const BusCycleResult &r)
 }
 
 void pack_cmd_for(CycleMotorCmd &c, const MotorMapEntry &e, const LimitParam &lim, bool send,
-                  bool expect, bool enabled, float kp, float kd, float q_cmd, bool have_q,
-                  float dq, float ha60_vref)
+                  bool expect, bool enabled, float kp, float kd, float tau_ff, float q_cmd,
+                  bool have_q, float dq, float ha60_vref)
 {
   c = {};
   c.can_id = e.can_id;
@@ -407,12 +357,13 @@ void pack_cmd_for(CycleMotorCmd &c, const MotorMapEntry &e, const LimitParam &li
   const float use_kp = enabled ? kp : 0.f;
   const float use_kd = enabled ? kd : 0.f;
   const float use_dq = enabled ? dq : 0.f;
-  pack_mit(c.data, use_kp, use_kd, q, use_dq, 0.f, lim);
+  const float use_tau = enabled ? tau_ff : 0.f;
+  pack_mit(c.data, use_kp, use_kd, q, use_dq, use_tau, lim);
 }
 
-void print_triangle_table(const std::vector<IdStats> &st, float stroke)
+void print_sine_table(const std::vector<IdStats> &st, float stroke)
 {
-  std::printf("\n=== P3 triangle q vs ±%.3f rad (probed q0, not firmware 0) ===\n",
+  std::printf("\n=== P3 sine q vs ±%.3f rad (probed q0, not firmware 0) ===\n",
               static_cast<double>(stroke));
   std::printf(" id  q0       q_min     q_max     peak_|q-q0|  |tau|peak\n");
   for (const auto &s : st)
@@ -480,26 +431,42 @@ const char *p3_bin_name(P3App app)
 void p3_print_usage(const P3Options &defaults)
 {
   const char *bin = p3_bin_name(defaults.app);
+  std::string ids_csv;
+  for (std::size_t i = 0; i < defaults.ids.size(); ++i)
+  {
+    if (i != 0)
+    {
+      ids_csv += ',';
+    }
+    ids_csv += std::to_string(defaults.ids[i]);
+  }
+  if (ids_csv.empty())
+  {
+    ids_csv = "(none)";
+  }
   std::printf(
       "Usage: %s [options]\n"
       "  P3 same-cycle write-all / drain-all. Missing motors timeout (drop), loop continues.\n"
       "  --period-ms MS        default %d\n"
       "  --duration SEC        default %.1f\n"
       "  --drain-ms MS         RX wait cap per cycle (default period-2)\n"
-      "  --kp --kd             MIT hold gains (default %.1f / %.2f, cap kp<=%.0f)\n"
-      "  --stage hold|triangle default hold (q=last, tau=0). triangle: q_des += vel*dt,\n"
-      "                        reverse at each motor's probed q0 ±stroke, same phase,\n"
+      "  --kp --kd             MIT gains (default %.1f / %.2f, cap kp<=%.0f kd<=%.0f)\n"
+      "  --tau-ff NM           MIT feedforward torque (default %.1f, sign kept;\n"
+      "                        wire saturates at that motor TMAX). HA60 ignores it.\n"
+      "  --stage hold|sine default hold (q=last). sine: q_des=q0+stroke*sin(phase),\n"
+      "                        dq_des=stroke*omega*cos(phase), same phase,\n"
       "                        same cycle (all selected IDs updated each tick).\n"
       "                        Does not home to firmware 0 (no dm_home_to_zero).\n"
       "                        HA60 uses evo servo θ_ref=q_des around probe q0.\n"
       "                        --comms-only is unchanged (no 0xFC, no motion).\n"
-      "  --vel RAD/S           triangle ramp rate (default %.2f, cap %.2f)\n"
-      "  --stroke RAD          triangle reverse |q_des-q0| (default %.3f = ±20 deg)\n"
-      "  --abort-tau NM        abort if |tau_fb| exceeds (default %.0f; do not raise)\n"
-      "  --ids 6               enable set (default 6). Example: --ids 6,8 or 3,4,5,6,7\n"
-      "                        If given, cycle/summary is only those IDs (unlisted stay off).\n"
-      "  --skip-motorevo [0|1] default 1; listing HA60 in --ids includes it (do not skip)\n"
-      "  --no-skip-motorevo    include HA60 only if also in --ids\n"
+      "  --vel RAD/S           sine peak speed (default %.2f, cap %.2f)\n"
+      "  --stroke RAD          sine peak displacement (default %.3f = ±20 deg)\n"
+      "  --abort-tau NM        abort if |tau_fb| exceeds. Default = that motor TMAX\n"
+      "                        (DM10010/L 200, DM10422 400, HA60 50). Override only.\n"
+      "  --ids LIST            motors to operate (default %s). Example: --ids 6,8\n"
+      "                        or --ids 3,4,5,6,7,8,9,10,11,12,13,14. Comma list,\n"
+      "                        not a range. Only listed IDs are probed/enabled/zeroed.\n"
+      "                        Unlisted stay off.\n"
       "  --require-all         exit 1 if any expected id has zero RX\n"
       "  --enable-all-anyway   enable --ids even if probe never replied\n"
       "  --comms-only          no 0xFC, no MIT hold/dq. RID + MIT kp=0 inquire\n"
@@ -509,20 +476,21 @@ void p3_print_usage(const P3Options &defaults)
       "  --left-port --right-port --yaml PATH\n"
       "  --handshake --verbose --self-test --set-zero\n"
       "  --set-zero            WRITES firmware zero at current shaft on selected\n"
-      "                        --ids (MIT 0xFE; HA60 V1 0xFE if listed). Not motion;\n"
-      "                        not 0xFC. Mutually exclusive with --stage hold|triangle.\n"
+      "                        --ids (official FF..FE SetzeroPosition). Not motion;\n"
+      "                        not 0xFC. Mutually exclusive with --stage hold|sine.\n"
       "                        Then 0xFD hygiene on those IDs.\n",
       bin, defaults.period_ms, defaults.duration_s, static_cast<double>(defaults.kp),
       static_cast<double>(defaults.kd), static_cast<double>(kKpCap),
+      static_cast<double>(kKdCap), static_cast<double>(defaults.tau_ff),
       static_cast<double>(kVelDefault), static_cast<double>(kVelCap),
-      static_cast<double>(kStrokeDefault), static_cast<double>(kAbortTauDefault));
+      static_cast<double>(kStrokeDefault), ids_csv.c_str());
   if (defaults.app == P3App::Dual12)
   {
     std::printf(
         "  --allow-single-bus    if ttyACM1 missing: error, then run left only\n"
-        "  --set-zero zeros the IDs this app selects (default --ids 6; skip\n"
-        "  Motorevo 8/14 unless listed). Current position → firmware origin on\n"
-        "  those IDs. Not motion; not 0xFC. Exclusive with --stage.\n");
+        "  --set-zero zeros the IDs this app selects (default all map 3–14,\n"
+        "  including HA60 8/14). Current position → firmware origin.\n"
+        "  Not motion; not 0xFC. Exclusive with --stage.\n");
   }
   if (defaults.app == P3App::FaultInject)
   {
@@ -534,19 +502,19 @@ void p3_print_usage(const P3Options &defaults)
   if (defaults.app == P3App::Right6)
   {
     std::printf(
-        "  Right bus only (CAN 9-14). Default --ids 12 (not the whole 9-14 set),\n"
-        "  default port %s.\n"
+        "  Right bus only (CAN 9-14). Default --ids 9,10,11,12,13,14 (all right map,\n"
+        "  including HA60 14), default port %s.\n"
         "  If ACM swapped: identity looks for ID12 D[0]=0x0C and uses that port.\n"
         "  --set-zero writes firmware zero on those selected IDs at the current\n"
-        "  shaft (default 12). Not motion; not 0xFC. Exclusive with --stage.\n"
-        "  HA60 ID14 uses evo V1 0xFE when listed in --ids / --no-skip-motorevo.\n",
+        "  shaft (default all right 9–14). Exclusive with --stage.\n"
+        "  HA60 uses official SetzeroPosition FF..FE when listed in --ids.\n",
         kDefaultPortRight);
   }
   std::printf(
-      "  Safety: default --ids 6. Big warning if enabling more than one motor.\n"
-      "  Without --ids: probe all Damiao on opened buses (3-7 / 9-13); skip Motorevo.\n"
-      "  With --ids: only those CAN IDs are sent/expected/enabled (HA60 if listed).\n"
-      "  Exit/SIGINT: P5 disable-all 0xFD on map IDs of open buses.\n");
+      "  Safety: this app default --ids %s. Big warning if enabling more than one motor.\n"
+      "  Only --ids are probed/enabled/zeroed. Unlisted stay off.\n"
+      "  Exit/SIGINT: P5 disable-all 0xFD on map IDs of open buses.\n",
+      ids_csv.c_str());
 }
 
 bool p3_parse_args(int argc, char **argv, P3Options &opt, std::string &err)
@@ -612,6 +580,15 @@ bool p3_parse_args(int argc, char **argv, P3Options &opt, std::string &err)
       }
       opt.kd = std::strtof(v, nullptr);
     }
+    else if (std::strcmp(argv[i], "--tau-ff") == 0)
+    {
+      const char *v = need("--tau-ff");
+      if (v == nullptr)
+      {
+        return false;
+      }
+      opt.tau_ff = std::strtof(v, nullptr);
+    }
     else if (std::strcmp(argv[i], "--stage") == 0)
     {
       const char *v = need("--stage");
@@ -623,13 +600,13 @@ bool p3_parse_args(int argc, char **argv, P3Options &opt, std::string &err)
       {
         opt.stage = P3Stage::Hold;
       }
-      else if (std::strcmp(v, "triangle") == 0)
+      else if (std::strcmp(v, "sine") == 0)
       {
-        opt.stage = P3Stage::Triangle;
+        opt.stage = P3Stage::Sine;
       }
       else
       {
-        err = "--stage must be hold|triangle";
+        err = "--stage must be hold|sine";
         return false;
       }
       opt.stage_set = true;
@@ -664,6 +641,11 @@ bool p3_parse_args(int argc, char **argv, P3Options &opt, std::string &err)
         return false;
       }
       opt.abort_tau = std::strtof(v, nullptr);
+      if (!(opt.abort_tau > 0.f))
+      {
+        err = "--abort-tau must be > 0";
+        return false;
+      }
     }
     else if (std::strcmp(argv[i], "--ids") == 0)
     {
@@ -697,24 +679,11 @@ bool p3_parse_args(int argc, char **argv, P3Options &opt, std::string &err)
         add_unique(opt.ignore_ids, id);
       }
     }
-    else if (std::strcmp(argv[i], "--skip-motorevo") == 0)
+    else if (std::strcmp(argv[i], "--skip-motorevo") == 0 ||
+             std::strcmp(argv[i], "--no-skip-motorevo") == 0)
     {
-      if (i + 1 < argc && argv[i + 1][0] != '-')
-      {
-        if (!parse_bool_flag(argv[++i], opt.skip_motorevo))
-        {
-          err = "--skip-motorevo expects 0 or 1";
-          return false;
-        }
-      }
-      else
-      {
-        opt.skip_motorevo = true;
-      }
-    }
-    else if (std::strcmp(argv[i], "--no-skip-motorevo") == 0)
-    {
-      opt.skip_motorevo = false;
+      err = "removed: list HA60 8/14 in --ids to operate them";
+      return false;
     }
     else if (std::strcmp(argv[i], "--require-all") == 0)
     {
@@ -851,8 +820,9 @@ bool p3_parse_args(int argc, char **argv, P3Options &opt, std::string &err)
   }
   if (opt.kp > kKpCap)
   {
-    std::printf("WARN: clamping kp %.1f -> %.1f (P3 hold is low-gain)\n",
-                static_cast<double>(opt.kp), static_cast<double>(kKpCap));
+    std::printf("WARN: clamping kp %.1f -> %.1f (MIT kp 0-%.0f)\n",
+                static_cast<double>(opt.kp), static_cast<double>(kKpCap),
+                static_cast<double>(kKpCap));
     opt.kp = kKpCap;
   }
   if (opt.kd < 0.f)
@@ -861,8 +831,9 @@ bool p3_parse_args(int argc, char **argv, P3Options &opt, std::string &err)
   }
   if (opt.kd > kKdCap)
   {
-    std::printf("WARN: clamping kd %.2f -> %.2f (P3 hold is low-gain)\n",
-                static_cast<double>(opt.kd), static_cast<double>(kKdCap));
+    std::printf("WARN: clamping kd %.2f -> %.2f (MIT kd 0-%.0f)\n",
+                static_cast<double>(opt.kd), static_cast<double>(kKdCap),
+                static_cast<double>(kKdCap));
     opt.kd = kKdCap;
   }
   if (opt.vel < 0.f)
@@ -886,16 +857,6 @@ bool p3_parse_args(int argc, char **argv, P3Options &opt, std::string &err)
   if (opt.stroke < 0.02f)
   {
     opt.stroke = 0.02f;
-  }
-  if (opt.abort_tau < 1.f)
-  {
-    opt.abort_tau = 1.f;
-  }
-  if (opt.abort_tau > kAbortTauDefault)
-  {
-    std::printf("WARN: clamping abort-tau %.1f -> %.0f (do not raise)\n",
-                static_cast<double>(opt.abort_tau), static_cast<double>(kAbortTauDefault));
-    opt.abort_tau = kAbortTauDefault;
   }
   return true;
 }
@@ -946,17 +907,16 @@ int p3_run(const P3Options &opt_in)
       listed_ha60 = true;
     }
   }
-  if (listed_ha60 && opt.skip_motorevo)
+  if (listed_ha60)
   {
-    std::printf("NOTE: --ids includes Motorevo HA60; skip_motorevo=0\n");
-    opt.skip_motorevo = false;
+    std::printf("NOTE: --ids includes Motorevo HA60\n");
   }
   if (opt.comms_only)
   {
     std::printf("comms-only: no 0xFC, no MIT hold/dq; RID + kp=0 inquire / HA60 evo status\n");
-    if (opt.stage == P3Stage::Triangle)
+    if (opt.stage == P3Stage::Sine)
     {
-      std::printf("comms-only: ignoring --stage triangle (no motion)\n");
+      std::printf("comms-only: ignoring --stage sine (no motion)\n");
     }
   }
 
@@ -1047,7 +1007,7 @@ int p3_run(const P3Options &opt_in)
         "\n"
         "**********************************************************************\n"
         "* WARN: --set-zero WRITES firmware zero at current shaft position.  *\n"
-        "* Selected --ids only. MIT 0xFE / HA60 V1 0xFE. No 0xFC.            *\n"
+        "* Selected --ids only. Official FF..FE SetzeroPosition.             *\n"
         "* Irreversible-ish. Shafts must be at the intended origin.          *\n"
         "**********************************************************************\n");
     bool all_ok = true;
@@ -1057,12 +1017,6 @@ int p3_run(const P3Options &opt_in)
       const auto *e = find_by_can_id(id);
       if (e == nullptr)
       {
-        continue;
-      }
-      if (e->model == MotorType::HA60 && opt.skip_motorevo)
-      {
-        std::printf("skip set-zero id=%u (Motorevo HA60; list in --ids or --no-skip-motorevo)\n",
-                    static_cast<unsigned>(id));
         continue;
       }
       UsbCanAdapter *ad = adapter_for(id);
@@ -1077,12 +1031,10 @@ int p3_run(const P3Options &opt_in)
       bool ok = false;
       if (e->model == MotorType::HA60)
       {
-        uint8_t z[8] = {};
-        pack_motorevo_set_zero(z);
-        ok = ad->sendCan(id, z, 8);
-        usleep(kDisableGapUs);
-        std::printf("set-zero id=%u %s (V1 0xFE) data=FF FF FF FF FF FF FF FE\n",
-                    static_cast<unsigned>(id), ok ? "sent" : "TX FAIL");
+        ok = evo_send_set_zero(*ad, id);
+        std::printf("set-zero id=%u %s (HA60 SetzeroPosition+SaveFlash) FE on %u save 0x%X\n",
+                    static_cast<unsigned>(id), ok ? "sent" : "TX FAIL",
+                    static_cast<unsigned>(id), motorevo_param_can_id(id));
       }
       else
       {
@@ -1121,58 +1073,20 @@ int p3_run(const P3Options &opt_in)
 
   std::vector<uint8_t> left_expected;
   std::vector<uint8_t> right_expected;
-  if (opt.ids_set)
+  for (uint8_t id : opt.ids)
   {
-    // Explicit --ids: cycle/summary/enable only those IDs (do not probe unlisted 3-7).
-    for (uint8_t id : opt.ids)
+    const auto *e = find_by_can_id(id);
+    if (e == nullptr)
     {
-      const auto *e = find_by_can_id(id);
-      if (e == nullptr)
-      {
-        continue;
-      }
-      if (e->model == MotorType::HA60 && opt.skip_motorevo)
-      {
-        continue;
-      }
-      if (e->bus == BusId::Left && left_open)
-      {
-        add_unique(left_expected, id);
-      }
-      else if (e->bus == BusId::Right && right_open)
-      {
-        add_unique(right_expected, id);
-      }
+      continue;
     }
-  }
-  else
-  {
-    left_expected = left_open ? expected_ids(BusId::Left, opt.skip_motorevo)
-                              : std::vector<uint8_t>{};
-    right_expected = right_open ? expected_ids(BusId::Right, opt.skip_motorevo)
-                                 : std::vector<uint8_t>{};
-    // Motorevo enters expected set only when we will actually send to it.
-    if (!opt.skip_motorevo)
+    if (e->bus == BusId::Left && left_open)
     {
-      for (uint8_t id : opt.ids)
-      {
-        if (is_motorevo_can_id(id))
-        {
-          const auto *e = find_by_can_id(id);
-          if (e == nullptr)
-          {
-            continue;
-          }
-          if (e->bus == BusId::Left && left_open)
-          {
-            add_unique(left_expected, id);
-          }
-          else if (e->bus == BusId::Right && right_open)
-          {
-            add_unique(right_expected, id);
-          }
-        }
-      }
+      add_unique(left_expected, id);
+    }
+    else if (e->bus == BusId::Right && right_open)
+    {
+      add_unique(right_expected, id);
     }
   }
 
@@ -1227,15 +1141,15 @@ int p3_run(const P3Options &opt_in)
       const bool ignore = contains_id(opt.ignore_ids, id);
       const bool en = !inquiry_only && enable.count(id) != 0;
       auto *st = find_stats(stats, id);
-      const bool tri = en && opt.stage == P3Stage::Triangle;
-      const float q_cmd = (st == nullptr) ? 0.f : (tri ? st->q_des : st->last_q);
+      const bool sine = en && opt.stage == P3Stage::Sine;
+      const float q_cmd = (st == nullptr) ? 0.f : (sine ? st->q_des : st->last_q);
       const bool have_q =
-          st != nullptr && (tri ? st->have_q0 : st->have_q);
-      const float dq = (tri && st != nullptr) ? st->vel_sign * opt.vel : 0.f;
-      const float vref = tri ? std::max(kHa60HoldVelLimit, opt.vel) : kHa60HoldVelLimit;
+          st != nullptr && (sine ? st->have_q0 : st->have_q);
+      const float dq = (sine && st != nullptr) ? st->dq_des : 0.f;
+      const float vref = sine ? std::max(kHa60HoldVelLimit, opt.vel) : kHa60HoldVelLimit;
       CycleMotorCmd c;
-      pack_cmd_for(c, *e, lims[id & 0x0F], !ignore, !ignore, en, opt.kp, opt.kd, q_cmd,
-                   have_q, dq, vref);
+      pack_cmd_for(c, *e, lims[id & 0x0F], !ignore, !ignore, en, opt.kp, opt.kd, opt.tau_ff,
+                   q_cmd, have_q, dq, vref);
       cmds.push_back(c);
     }
     return cmds;
@@ -1243,15 +1157,22 @@ int p3_run(const P3Options &opt_in)
 
   const auto period = std::chrono::milliseconds(opt.period_ms);
   const auto drain = std::chrono::milliseconds(opt.drain_ms);
+  char abort_tau_buf[32] = "TMAX";
+  if (opt.abort_tau > 0.f)
+  {
+    std::snprintf(abort_tau_buf, sizeof(abort_tau_buf), "%.0f",
+                  static_cast<double>(opt.abort_tau));
+  }
 
   std::printf(
-      "P3 %s  period=%dms drain=%dms duration=%.1fs kp=%.1f kd=%.2f skip_motorevo=%d\n"
-      "stage=%s vel=%.3f stroke=±%.3f abort-tau=%.0f\n"
+      "P3 %s  period=%dms drain=%dms duration=%.1fs kp=%.1f kd=%.2f tau_ff=%.3f\n"
+      "stage=%s vel=%.3f stroke=±%.3f abort-tau=%s\n"
       "expected left:",
       p3_bin_name(opt.app), opt.period_ms, opt.drain_ms, opt.duration_s,
-      static_cast<double>(opt.kp), static_cast<double>(opt.kd), opt.skip_motorevo ? 1 : 0,
-      opt.stage == P3Stage::Triangle ? "triangle" : "hold", static_cast<double>(opt.vel),
-      static_cast<double>(opt.stroke), static_cast<double>(opt.abort_tau));
+      static_cast<double>(opt.kp), static_cast<double>(opt.kd),
+      static_cast<double>(opt.tau_ff),
+      opt.stage == P3Stage::Sine ? "sine" : "hold", static_cast<double>(opt.vel),
+      static_cast<double>(opt.stroke), abort_tau_buf);
   for (uint8_t id : left_expected)
   {
     std::printf(" %u", static_cast<unsigned>(id));
@@ -1350,7 +1271,7 @@ int p3_run(const P3Options &opt_in)
   std::vector<uint8_t> actually_enabled;
   if (opt.comms_only)
   {
-    std::printf("comms-only RID / evo status (read-only; no CTRL_MODE write, no 0xFC):\n");
+    std::printf("comms-only CTRL_MODE / evo status (read-only; no write, no 0xFC):\n");
     for (uint8_t id : all_expected)
     {
       const auto *e = find_by_can_id(id);
@@ -1367,7 +1288,7 @@ int p3_run(const P3Options &opt_in)
       }
       if (!here)
       {
-        std::printf("id=%u %s %s missing; skip RID\n", static_cast<unsigned>(id),
+        std::printf("id=%u %s %s missing; skip\n", static_cast<unsigned>(id),
                     to_string(e->model), to_string(e->joint));
         continue;
       }
@@ -1375,28 +1296,20 @@ int p3_run(const P3Options &opt_in)
       FrameDemux *dm = demux_for(id, left_demux, right_demux);
       if (ad == nullptr || !ad->is_open() || dm == nullptr)
       {
-        std::printf("id=%u skip RID (adapter not open)\n", static_cast<unsigned>(id));
+        std::printf("id=%u skip (adapter not open)\n", static_cast<unsigned>(id));
         continue;
       }
-      DmMitEnableStatus rst;
-      LimitParam lim = lims[id & 0x0F];
-      dm_read_pvt_limits(*ad, *dm, id, lim, &rst);
-      if (rst.rid_ok)
-      {
-        lims[id & 0x0F] = lim;
-      }
+      const LimitParam lim = lims[id & 0x0F];
       float mode_f = 0.f;
       const bool cm_ok =
           dm_read_rid(*ad, *dm, id, static_cast<uint8_t>(DmRid::CtrlMode), mode_f);
       const uint32_t cm = static_cast<uint32_t>(mode_f + 0.5f);
-      std::printf("id=%u %s %s RID 21/22/23 PMAX=%s%.4f VMAX=%s%.4f TMAX=%s%.4f "
+      std::printf("id=%u %s %s table PMAX=%.4f VMAX=%.4f TMAX=%.4f "
                   "CTRL_MODE=%s%u (%s)\n",
                   static_cast<unsigned>(id), to_string(e->model), to_string(e->joint),
-                  rst.pmax_ok ? "" : "FAIL ", static_cast<double>(rst.pmax),
-                  rst.vmax_ok ? "" : "FAIL ", static_cast<double>(rst.vmax),
-                  rst.tmax_ok ? "" : "FAIL ", static_cast<double>(rst.tmax),
-                  cm_ok ? "" : "FAIL ", static_cast<unsigned>(cm),
-                  cm_ok ? dm_ctrl_mode_name(cm) : "?");
+                  static_cast<double>(lim.q_max), static_cast<double>(lim.dq_max),
+                  static_cast<double>(lim.tau_max), cm_ok ? "" : "FAIL ",
+                  static_cast<unsigned>(cm), cm_ok ? dm_ctrl_mode_name(cm) : "?");
     }
   }
   else
@@ -1430,7 +1343,7 @@ int p3_run(const P3Options &opt_in)
         "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n");
   }
 
-  // RID + CTRL_MODE + 0xFC for Damiao; Motorevo HA60 also 0xFC then conservative servo hold.
+  // CTRL_MODE + 0xFC for Damiao; Motorevo HA60 also 0xFC then conservative servo hold.
   for (uint8_t id : enable_ids)
   {
     const auto *e = find_by_can_id(id);
@@ -1469,48 +1382,12 @@ int p3_run(const P3Options &opt_in)
       continue;
     }
 
-    if (e->model == MotorType::DM10422)
-    {
-      DmMitEnableStatus st;
-      const DmMitEnableErr en = dm_enable_mit(*ad, *dm, id, true, st);
-      std::printf("id=%u RID 21/22/23 PMAX=%s%.4f VMAX=%s%.4f TMAX=%s%.4f\n",
-                  static_cast<unsigned>(id), st.pmax_ok ? "" : "FAIL ",
-                  static_cast<double>(st.pmax), st.vmax_ok ? "" : "FAIL ",
-                  static_cast<double>(st.vmax), st.tmax_ok ? "" : "FAIL ",
-                  static_cast<double>(st.tmax));
-      if (en == DmMitEnableErr::Rid)
-      {
-        std::fprintf(stderr,
-                     "REFUSE enable id=%u: DM10422 limits UNVERIFIED (RID 21/22/23 failed)\n",
-                     static_cast<unsigned>(id));
-        continue;
-      }
-      lims[id & 0x0F] = st.lim;
-      std::printf("id=%u CTRL_MODE before=%s%u write=%s after=%s%u (%s)\n",
-                  static_cast<unsigned>(id), st.ctrl_before_ok ? "" : "FAIL ",
-                  static_cast<unsigned>(st.ctrl_before), st.wrote_ack ? "ack" : "NO-ACK",
-                  st.ctrl_after_ok ? "" : "FAIL ", static_cast<unsigned>(st.ctrl_after),
-                  dm_ctrl_mode_name(st.ctrl_after));
-      if (en != DmMitEnableErr::Ok)
-      {
-        if (en == DmMitEnableErr::CtrlMode)
-        {
-          std::fprintf(stderr, "REFUSE enable id=%u: need CTRL_MODE=MIT(1)\n",
-                       static_cast<unsigned>(id));
-        }
-        else
-        {
-          std::fprintf(stderr, "enable send failed id=%u\n", static_cast<unsigned>(id));
-        }
-        continue;
-      }
-      std::printf("enable id=%u sent (0xFC)\n", static_cast<unsigned>(id));
-      actually_enabled.push_back(id);
-      continue;
-    }
-
+    const LimitParam lim = lims[id & 0x0F];
+    std::printf("id=%u table PMAX=%.4f VMAX=%.4f TMAX=%.4f\n", static_cast<unsigned>(id),
+                static_cast<double>(lim.q_max), static_cast<double>(lim.dq_max),
+                static_cast<double>(lim.tau_max));
     DmMitEnableStatus st;
-    const DmMitEnableErr en = dm_enable_mit(*ad, *dm, id, false, st);
+    const DmMitEnableErr en = dm_enable_mit(*ad, *dm, id, st);
     std::printf("id=%u CTRL_MODE before=%s%u write=%s after=%s%u (%s)\n",
                 static_cast<unsigned>(id), st.ctrl_before_ok ? "" : "FAIL ",
                 static_cast<unsigned>(st.ctrl_before), st.wrote_ack ? "ack" : "NO-ACK",
@@ -1556,19 +1433,20 @@ int p3_run(const P3Options &opt_in)
       s.q_min = s.last_q;
       s.q_max = s.last_q;
       s.have_q0 = true;
-      s.vel_sign = 1.f;
+      s.dq_des = 0.f;
     }
   }
 
-  const bool do_triangle =
-      !opt.comms_only && opt.stage == P3Stage::Triangle && !actually_enabled.empty();
-  if (do_triangle)
+  const bool do_sine =
+      !opt.comms_only && opt.stage == P3Stage::Sine && !actually_enabled.empty();
+  if (do_sine)
   {
-    std::printf("triangle: no firmware-zero home; q_des reverse at probed q0 ±%.3f rad\n"
-                "same phase/period: all enabled IDs each %d ms tick  vel=%.3f abort-tau=%.0f\n"
+    std::printf("sine: no firmware-zero home; q_des=q0+%.3f*sin(phase), "
+                "dq_des=%.3f*cos(phase)\n"
+                "same phase/period: all enabled IDs each %d ms tick  abort-tau=%s\n"
                 "q0",
-                static_cast<double>(opt.stroke), opt.period_ms, static_cast<double>(opt.vel),
-                static_cast<double>(opt.abort_tau));
+                static_cast<double>(opt.stroke), static_cast<double>(opt.vel),
+                opt.period_ms, abort_tau_buf);
     for (const auto &s : stats)
     {
       if (s.enabled && s.have_q0)
@@ -1597,15 +1475,14 @@ int p3_run(const P3Options &opt_in)
   const auto t0 = BusCycle::Clock::now();
   const auto duration = std::chrono::duration<double>(opt.duration_s);
   auto next = t0;
-  auto last_print = t0;
-  const float dt = static_cast<float>(opt.period_ms) * 0.001f;
   const float abort_q = opt.stroke + kAbortQMargin;
 
   if (!opt.comms_only)
   {
-    if (do_triangle)
+    if (do_sine)
     {
-      std::printf("triangle loop start (q_des += vel*dt, reverse at probed q0±stroke). "
+      std::printf("sine loop start (q_des=q0+stroke*sin(phase), "
+                  "dq_des=stroke*omega*cos(phase)). "
                   "SIGINT disables selected ids.\n");
     }
     else
@@ -1617,27 +1494,21 @@ int p3_run(const P3Options &opt_in)
   while (g_run.load() && !aborted && (BusCycle::Clock::now() - t0) < duration)
   {
     next += period;
-    if (do_triangle)
+    if (do_sine)
     {
+      const double elapsed_s =
+          std::chrono::duration<double>(BusCycle::Clock::now() - t0).count();
+      const double omega =
+          opt.stroke > 1e-6f ? static_cast<double>(opt.vel / opt.stroke) : 0.0;
+      const double phase = omega * elapsed_s;
       for (auto &s : stats)
       {
         if (!s.enabled || !s.have_q0)
         {
           continue;
         }
-        s.q_des += s.vel_sign * opt.vel * dt;
-        const float q_hi = s.q0 + opt.stroke;
-        const float q_lo = s.q0 - opt.stroke;
-        if (s.q_des > q_hi)
-        {
-          s.q_des = q_hi;
-          s.vel_sign = -1.f;
-        }
-        else if (s.q_des < q_lo)
-        {
-          s.q_des = q_lo;
-          s.vel_sign = 1.f;
-        }
+        s.q_des = s.q0 + opt.stroke * std::sin(phase);
+        s.dq_des = static_cast<float>(opt.stroke * omega * std::cos(phase));
       }
     }
     auto lc = build_cmds(left_expected, enable_set, opt.comms_only);
@@ -1652,12 +1523,17 @@ int p3_run(const P3Options &opt_in)
     if (tick.overrun)
     {
       ++overruns;
+      std::fprintf(stderr,
+                   "ABORT communication timeout: cycle elapsed=%.3fms > period=%dms\n",
+                   tick.elapsed_ms, opt.period_ms);
+      safety_set_reason(SafetyReason::CommunicationTimeout);
+      aborted = true;
     }
     const double dt_us =
         std::chrono::duration<double, std::micro>(BusCycle::Clock::now() - t_send).count();
     jitter.push(dt_us);
 
-    if (do_triangle)
+    if (do_sine)
     {
       for (const auto &s : stats)
       {
@@ -1665,12 +1541,13 @@ int p3_run(const P3Options &opt_in)
         {
           continue;
         }
-        if (std::fabs(s.last_tau) > opt.abort_tau)
+        const float tau_lim = abort_tau_nm(opt.abort_tau, s.can_id, lims[s.can_id & 0x0F].tau_max);
+        if (std::fabs(s.last_tau) > tau_lim)
         {
           std::fprintf(stderr, "ABORT id=%u: |tau_fb|=%.3f > %.3f Nm\n",
                        static_cast<unsigned>(s.can_id),
                        static_cast<double>(std::fabs(s.last_tau)),
-                       static_cast<double>(opt.abort_tau));
+                       static_cast<double>(tau_lim));
           safety_set_reason(SafetyReason::HardLimitTau);
           aborted = true;
         }
@@ -1686,11 +1563,7 @@ int p3_run(const P3Options &opt_in)
       }
     }
 
-    const auto now = BusCycle::Clock::now();
-    const bool print_now =
-        opt.verbose || cycles <= 3 ||
-        (now - last_print) >= std::chrono::milliseconds(500);
-    if (print_now)
+    if (opt.verbose)
     {
       std::printf("cycle %llu elapsed=%.2fms overrun=%d  ",
                   static_cast<unsigned long long>(cycles), tick.elapsed_ms,
@@ -1704,7 +1577,7 @@ int p3_run(const P3Options &opt_in)
           }
           else if (m.rx_ok)
           {
-            if (do_triangle)
+            if (do_sine)
             {
               auto *st = find_stats(stats, m.can_id);
               const float qdes = st != nullptr ? st->q_des : 0.f;
@@ -1729,7 +1602,6 @@ int p3_run(const P3Options &opt_in)
       dump(tick.left);
       dump(tick.right);
       std::printf("\n");
-      last_print = now;
     }
 
     const auto remain = next - BusCycle::Clock::now();
@@ -1741,10 +1613,10 @@ int p3_run(const P3Options &opt_in)
   }
 
   print_summary_table(stats, overruns, cycles);
-  if (do_triangle)
+  if (do_sine)
   {
-    print_triangle_table(stats, opt.stroke);
-    std::printf("triangle: %s\n", aborted ? "ABORT" : "clean (duration)");
+    print_sine_table(stats, opt.stroke);
+    std::printf("sine: %s\n", aborted ? "ABORT" : "clean (duration)");
   }
   std::printf("jitter_us mean=%.1f max_dev=%.1f  (period=%d ms)\n", jitter.mean_us(),
               jitter.max_deviation_us(), opt.period_ms);

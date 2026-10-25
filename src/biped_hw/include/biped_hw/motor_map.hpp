@@ -40,7 +40,7 @@ inline constexpr std::array<MotorMapEntry, kMotorCount> kMotorMap{{
     {BusId::Left, kMasterId, 5, JointId::LHipParallelInner, MotorType::DM10010,
      ""},
     {BusId::Left, kMasterId, 6, JointId::LKneePitch, MotorType::DM10422,
-     "cable 1:1; table {12.5,20,400}, RID 21/22/23 overrides"},
+     "cable 1:1; table {12.5,20,400}"},
     {BusId::Left, kMasterId, 7, JointId::LAnklePitch, MotorType::DM10010L,
      "cable 1:1"},
     {BusId::Left, kMasterId, 8, JointId::LAnkleRoll, MotorType::HA60,
@@ -120,6 +120,32 @@ inline constexpr const MotorMapEntry *find_by_can_id(uint8_t can_id)
     }
   }
   return nullptr;
+}
+
+// Pack-range TMAX is the motor peak torque used as default abort-tau.
+inline float peak_tau_nm(MotorType type)
+{
+  return default_limit(type).tau_max;
+}
+
+inline float peak_tau_nm(uint8_t can_id)
+{
+  const auto *e = find_by_can_id(can_id);
+  return e != nullptr ? peak_tau_nm(e->model) : 0.f;
+}
+
+// user_nm > 0 overrides. Else live RID/pack TMAX if given, else map peak.
+inline float abort_tau_nm(float user_nm, uint8_t can_id, float live_tmax = 0.f)
+{
+  if (user_nm > 0.f)
+  {
+    return user_nm;
+  }
+  if (live_tmax > 0.1f)
+  {
+    return live_tmax;
+  }
+  return peak_tau_nm(can_id);
 }
 
 inline constexpr bool mapped_damiao_mit_master2(uint8_t can_id)

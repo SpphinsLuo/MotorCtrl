@@ -16,11 +16,10 @@ class UsbCanAdapter;
 
 // q_soft/q_hard are |q| rad on the motor shaft (motor_map CAN ID), not hip FK.
 // Joint-space hip roll/pitch limits can later use hip_fk output; P5 stays per ID.
-// tau_hard matches existing abort-tau style (15 Nm). Do not raise.
+// tau_hard is that motor's peak (LimitParam.tau_max / TMAX).
 //--------------------------------限位具体值需后续根据实际修改-----------------------------------------
 inline constexpr float kSafetyQSoftRad = 10.f;
 inline constexpr float kSafetyQHardRad = 12.f;
-inline constexpr float kSafetyTauHardNm = 15.f;
 inline constexpr int kSafetyWatchdogMs = 40;
 inline constexpr int kSafetyDropStreak = 3;
 inline constexpr double kSafetyStaleMs = 50.0;
@@ -34,6 +33,7 @@ enum class SafetyReason : uint8_t
   HardLimitTau,
   Drop,
   RidFail,
+  CommunicationTimeout,
 };
 
 enum class SafetyLimitHit : uint8_t
@@ -76,6 +76,9 @@ bool safety_watchdog_expired(const SafetyWatchdog &wd, std::int64_t now_ns);
 
 // Consecutive no-RX on a selected CAN ID. Returns true at kSafetyDropStreak.
 bool safety_note_rx(SafetyDropWatch &w, uint8_t can_id, bool rx_ok);
+
+// Communication/control-cycle work exceeded the configured control period.
+bool safety_communication_timeout(double elapsed_ms, double period_ms);
 
 void safety_estop_trip();
 bool safety_estop_latched();

@@ -46,8 +46,6 @@ constexpr int kEnableSettleUs = 100000;
 constexpr int kProbeTicks = 20;
 constexpr float kHoldKp = 20.f;
 constexpr float kHoldKd = 1.f;
-constexpr float kAbortTauNm = 15.f;
-
 biped_hw::UsbCanAdapter *g_left = nullptr;
 biped_hw::UsbCanAdapter *g_right = nullptr;
 
@@ -102,7 +100,7 @@ void usage()
       "     --enable-knees: 0xFC only decimal CAN 6 (left) and 12 (right).\n"
       "     Probe q0 with kp=0, then MIT hold at that q (kp=20 kd=1, dq=0).\n"
       "     Does not spin 5 rad/s. Does not enable IDs 3–5,7–11,13–14.\n"
-      "     abort-tau=15 Nm (not a flag; do not raise). Fault: P5 disable-all 0xFD\n"
+      "     abort-tau = that motor TMAX (knees DM10422 = 400). Not a flag.\n"
       "     on map 3-14 (both buses). No --force-limits. Requires both USB-CAN ports.\n"
       "MBS: --mbs polls 8 joint addrs from config/mbs_encoder.yaml\n"
       "     (decimal 4,5,6,7,10,11,12,13) sequential on one BUS-D.\n"
@@ -237,7 +235,7 @@ bool parse_args(int argc, char **argv, Options &opt, std::string &err)
     else if (std::strcmp(argv[i], "--abort-tau") == 0 ||
              std::strcmp(argv[i], "--force-limits") == 0)
     {
-      err = std::string(argv[i]) + " is not a p4 flag (abort-tau is 15; no --force-limits)";
+      err = std::string(argv[i]) + " is not a p4 flag (abort-tau is motor TMAX; no --force-limits)";
       return false;
     }
     else
@@ -363,22 +361,13 @@ struct KneeHold
 
 bool enable_knee(KneeHold &k, biped_hw::UsbCanAdapter &ad, biped_hw::FrameDemux &dm)
 {
+  const auto *e = biped_hw::find_by_can_id(k.can_id);
+  k.lim = e != nullptr ? biped_hw::default_limit(e->model) : biped_hw::kLimitDm10422;
   biped_hw::DmMitEnableStatus st;
-  const biped_hw::DmMitEnableErr en =
-      biped_hw::dm_enable_mit(ad, dm, k.can_id, true, st);
-  std::printf("id=%u RID 21/22/23 PMAX=%s%.4f VMAX=%s%.4f TMAX=%s%.4f\n",
-              static_cast<unsigned>(k.can_id), st.pmax_ok ? "" : "FAIL ",
-              static_cast<double>(st.pmax), st.vmax_ok ? "" : "FAIL ",
-              static_cast<double>(st.vmax), st.tmax_ok ? "" : "FAIL ",
-              static_cast<double>(st.tmax));
-  if (en == biped_hw::DmMitEnableErr::Rid)
-  {
-    std::fprintf(stderr,
-                 "REFUSE enable id=%u: Damiao MIT limits UNVERIFIED (RID 21/22/23 failed)\n",
-                 static_cast<unsigned>(k.can_id));
-    return false;
-  }
-  k.lim = st.lim;
+  const biped_hw::DmMitEnableErr en = biped_hw::dm_enable_mit(ad, dm, k.can_id, st);
+  std::printf("id=%u table PMAX=%.4f VMAX=%.4f TMAX=%.4f\n",
+              static_cast<unsigned>(k.can_id), static_cast<double>(k.lim.q_max),
+              static_cast<double>(k.lim.dq_max), static_cast<double>(k.lim.tau_max));
   std::printf("id=%u CTRL_MODE before=%s%u write=%s after=%s%u (%s)\n",
               static_cast<unsigned>(k.can_id), st.ctrl_before_ok ? "" : "FAIL ",
               static_cast<unsigned>(st.ctrl_before), st.wrote_ack ? "ack" : "NO-ACK",
@@ -435,7 +424,7 @@ void print_summary(const biped_hw::RobotState &st, bool abort_tau)
       static_cast<long long>(st.t_cycle_ns), biped_hw::motors_valid_count(st),
       biped_hw::kMotorCount, biped_hw::mbs_valid_count(st),
       biped_hw::kMbsEncoderCount, st.imu.valid ? 1 : 0,
-      abort_tau ? " ABORT |tau|>15" : "");
+      abort_tau ? " ABORT |tau|>TMAX" : "");
   print_knee_motor(st, kKneeLeftId);
   print_knee_motor(st, kKneeRightId);
   print_knee_mbs(st, kKneeLeftId);
@@ -516,7 +505,7 @@ int run(Options opt, int argc, char **argv)
 {
   std::printf(
       "p4_state_dump duration=%.1f period-ms=%d motors=%s mbs=%s imu=%s "
-      "(abort-tau=15, no --force-limits)\n",
+      "(abort-tau=TMAX, no --force-limits)\n",
       opt.duration_s, opt.period_ms,
       opt.no_motors ? "off" : (opt.enable_knees ? "enable-knees(6,12 hold)" : "listen"),
       opt.mbs ? (opt.mbs_addr_set ? "single" : "map8") : "off",
@@ -586,7 +575,6 @@ int run(Options opt, int argc, char **argv)
     biped_hw::safety_bind_buses(&left_ad, &right_ad);
     if (!enable_knee(knee_l, left_ad, left_demux))
     {
-      biped_hw::safety_set_reason(biped_hw::SafetyReason::RidFail);
       disable_all_now(true);
       return 1;
     }
@@ -594,7 +582,6 @@ int run(Options opt, int argc, char **argv)
     usleep(kEnableSettleUs);
     if (!enable_knee(knee_r, right_ad, right_demux))
     {
-      biped_hw::safety_set_reason(biped_hw::SafetyReason::RidFail);
       disable_all_now(true);
       return 1;
     }
@@ -725,14 +712,16 @@ int run(Options opt, int argc, char **argv)
       const int i12 = biped_hw::motor_index_by_can_id(kKneeRightId);
       const float tau6 = i6 >= 0 ? st.motors[static_cast<std::size_t>(i6)].tau : 0.f;
       const float tau12 = i12 >= 0 ? st.motors[static_cast<std::size_t>(i12)].tau : 0.f;
+      const float a6 = biped_hw::peak_tau_nm(kKneeLeftId);
+      const float a12 = biped_hw::peak_tau_nm(kKneeRightId);
       if ((i6 >= 0 && st.motors[static_cast<std::size_t>(i6)].valid &&
-           std::fabs(tau6) > kAbortTauNm) ||
+           std::fabs(tau6) > a6) ||
           (i12 >= 0 && st.motors[static_cast<std::size_t>(i12)].valid &&
-           std::fabs(tau12) > kAbortTauNm))
+           std::fabs(tau12) > a12))
       {
-        std::fprintf(stderr, "ABORT |tau|>%.1f (id6=%.3f id12=%.3f); P5 disable-all 0xFD\n",
-                     static_cast<double>(kAbortTauNm), static_cast<double>(tau6),
-                     static_cast<double>(tau12));
+        std::fprintf(stderr, "ABORT |tau|>TMAX (id6=%.3f/%.0f id12=%.3f/%.0f); P5 0xFD\n",
+                     static_cast<double>(tau6), static_cast<double>(a6),
+                     static_cast<double>(tau12), static_cast<double>(a12));
         biped_hw::safety_set_reason(biped_hw::SafetyReason::HardLimitTau);
         abort_tau = true;
         g_run = 0;

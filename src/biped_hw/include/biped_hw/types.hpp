@@ -59,8 +59,8 @@ inline constexpr uint8_t kMasterId = 0x02;
 // payload D[0] low nibble (ESC_ID), not by the USB-CAN reported canId.
 // Official SDK: https://gitee.com/kit-miao/damiao (motor-sdk). Do not vendor it.
 //
-// Pack-range defaults (PMAX / VMAX / TMAX). Firmware RID 21/22/23 overrides
-// at runtime when successfully read. HA60 ranges are Motorevo (not Damiao MIT).
+// Pack-range defaults (PMAX / VMAX / TMAX). All MIT pack/unpack uses this table.
+// Do not read firmware RID 21/22/23 for limits. HA60 ranges are Motorevo.
 struct LimitParam
 {
   float q_max = 0.f;//单位：rad

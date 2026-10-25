@@ -22,7 +22,7 @@ void usage()
       "  --help          this message (rc=0)\n"
       "Does not enable motors. Live 0xFC is not a flag.\n"
       "Limits are per CAN ID (motor_map 12); q_soft=10 rad hold, q_hard=12 rad\n"
-      "disable, tau_hard=15 Nm (abort-tau style, not raised). No hip IK geometry.\n"
+      "disable, tau_hard = that motor TMAX. No hip IK geometry.\n"
       "E-stop is a software latch + SIGINT/SIGTERM; no GPIO.\n"
       "Disable-all reuses dm_send_disable (0xFD) on both buses.\n");
 }
@@ -48,7 +48,7 @@ int main(int argc, char **argv)
     if (std::strcmp(argv[i], "--force-limits") == 0 ||
         std::strcmp(argv[i], "--abort-tau") == 0)
     {
-      std::fprintf(stderr, "%s is not a p5 flag (tau_hard=15; no --force-limits)\n", argv[i]);
+      std::fprintf(stderr, "%s is not a p5 flag (tau_hard=TMAX; no --force-limits)\n", argv[i]);
       return 2;
     }
     err = std::string("unknown argument: ") + argv[i] + " (try --help)";

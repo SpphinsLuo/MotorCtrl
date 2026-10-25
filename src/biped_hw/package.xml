@@ -7,9 +7,8 @@
   <version>0.0.1</version>
   <description>
     Cable-driven biped hardware: compile-time 12-motor map, USB-CAN adapter,
-    Damiao MIT + Motorevo HA60 codec. P1 first-gate p1_left_dm_id6 is left knee
-    CAN 6; p1_left_evo_id8 is left ankle-roll HA60 CAN 8 (servo, no Damiao IDs).
-    P2 evo: p2_evo_servo_track (HA60 CAN 8 servo step/ramp around q0).
+    Damiao MIT + Motorevo HA60 codec. P1: p1_dm_communicate / p1_evo_communicate
+    (CAN ID is kCanId in the source). P2: p2_dm_test / p2_evo_test.
     P3 dual-bus: p3_dual_knee_spin (left CAN 6 ACM0 + right CAN 9 ACM1 Damiao MIT slow ramp).
     MBS magnetic encoder RS485 poll: mbs_encoder_recv (USB-RS485 by-id, not ttyUSB0).
     P4 RobotState dump: p4_state_dump (listen-only or --enable-knees 6+12 hold + MBS + /imu latch).

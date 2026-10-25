@@ -1,7 +1,7 @@
 // biped_hw — metrics.hpp
 // P2 闭环阶梯指标：跟踪误差（rms/max）、周期抖动、RTT 汇总，以及 settle 估计。
 // 位置档误差为 q_des−q；速度档误差为 dq_des−dq（位置斜坡上的速度跟踪）。
-// 被 p2_dm_mit_ladder 与 p2_evo_servo_track 使用。
+// 被 p2_dm_test 与 p2_evo_test 使用。
 #pragma once
 
 // Running metrics for P2 closed-loop ladder tests: tracking error, period

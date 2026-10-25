@@ -1,12 +1,5 @@
-//达妙电机闭环测试程序
-// P2 单电机 Damiao 阶梯：位置 → 速度 → 力矩。默认 CAN ID / 串口不变。
-// 默认 --ctrl-mode mit：行为与原先 MIT 阶梯相同（pack_mit，CTRL_MODE=1）。
-// --ctrl-mode pos_vel|vel|pos_force 写对应 CTRL_MODE 并用 datasheet CAN 偏移发帧。
-// --ctrl-mode auto：pos→POS_VEL，vel/dq→VEL，torque→POS_FORCE（段间 disable→写模式→enable）。
-// 默认 CAN ID 必须是 map 内 Damiao MIT（Master 2）。显式 --can-id 跳过 map
-// --stage vel 在 MIT/POS_VEL 是位置斜坡：q_des += vel_cmd*dt；在 VEL 是真实速度指令。
-// --stage dq 仅 MIT（kd-only）或 VEL。|q-q0|>=--vel-stroke 后 0xFD。
-// --stage 使能后先测 |q|；偏离零则 MIT 回零（不是 0xFE）再跑 profile。
+// 达妙电机闭环测试。CTRL_MODE / 0xFE / 回零在 dm_mit_host；本文件只跑阶梯。
+// CAN ID 默认 kCanId，可用 --can-id 覆盖（十进制）。默认 --ctrl-mode mit。
 #include "biped_hw/cli.hpp"
 #include "biped_hw/cycle_logger.hpp"
 #include "biped_hw/dm_codec.hpp"
@@ -33,26 +26,27 @@
 namespace
 {
 
-constexpr uint8_t kDefaultEscId = 6;
+// Default kCanId; --can-id overrides (decimal). Must be mapped Damiao MIT, Master 2.
+constexpr uint8_t kCanId = 9;
 constexpr int kEnableSettleUs = 100000;
 constexpr int kDisableGapUs = 10000;
 constexpr float kLimitFracPos = 0.1f;   // 10% of PMAX
 constexpr float kLimitFracVel = 0.1f;   // 10% of VMAX
 constexpr float kLimitFracTau = 0.1f;   // 10% of TMAX
 constexpr float kSafeQMarginFrac = 0.08f;
-constexpr float kKpPosMax = 200.f;  // Damiao MIT kp is 0-500; 20 was wrongly clamping --kp-pos 80
-constexpr float kKdMitMax = 5.f;  // Damiao MIT kd pack range 0-5; do not clamp to 0.5
+constexpr float kKpPosMax = biped_hw::kMitKpMax;
+constexpr float kKdMitMax = biped_hw::kMitKdMax;
 constexpr float kVelStrokeDefault = 0.2f;  // rad; 24V bench must not integrate forever
 
 std::atomic<bool> g_run{true};
-std::atomic<uint8_t> g_esc_id{kDefaultEscId};
+std::atomic<uint8_t> g_esc_id{kCanId};
 biped_hw::UsbCanAdapter *g_exit_adapter = nullptr;
 
-// Tee stdout/stderr to /tmp last log + a timestamped copy so terminal scroll
+// Tee stdout/stderr to MotorCtrl/log last + timestamped copy so terminal scroll
 // cannot swallow CTRL_MODE / REG TX / RID dump / MIT_LIVE_CHECK.
 struct SessionLog
 {
-  std::string last_path{"/tmp/biped_hw_p2_last.log"};
+  std::string last_path{"/home/ye/00_jfl_26.10/MotorCtrl/log/biped_hw_p2_last.log"};
   std::string stamp_path;
   std::FILE *last_fp = nullptr;
   std::FILE *stamp_fp = nullptr;
@@ -119,25 +113,7 @@ struct SessionLog
 
   bool open()
   {
-    std::error_code ec;
-    std::filesystem::create_directories("/home/ye/00_jfl_26.10/data", ec);
-    std::filesystem::create_directories("/home/ye/00_jfl_26.10/MotorCtrl/log", ec);
-
-    std::time_t now = std::time(nullptr);
-    std::tm tm{};
-    localtime_r(&now, &tm);
-    char ts[32] = {};
-    std::strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tm);
-
-    last_fp = std::fopen(last_path.c_str(), "w");
-    stamp_path = std::string("/home/ye/00_jfl_26.10/data/p2_dm_mit_ladder_") + ts + ".log";
-    stamp_fp = std::fopen(stamp_path.c_str(), "w");
-    if (stamp_fp == nullptr)
-    {
-      stamp_path = std::string("/home/ye/00_jfl_26.10/MotorCtrl/log/p2_dm_mit_ladder_") + ts + ".log";
-      stamp_fp = std::fopen(stamp_path.c_str(), "w");
-    }
-    return last_fp != nullptr || stamp_fp != nullptr;
+    return true;
   }
 
   void close()
@@ -166,21 +142,12 @@ struct SessionLogGuard
 
 void print_cycle_tee(const biped_hw::CycleLogger &log, const char *extra, bool console)
 {
-  if (console)
+  if (!console)
   {
-    log.print_cycle(stdout, extra);
-    std::fflush(stdout);
+    return;
   }
-  if (g_slog.last_fp != nullptr)
-  {
-    log.print_cycle(g_slog.last_fp, extra);
-    std::fflush(g_slog.last_fp);
-  }
-  if (g_slog.stamp_fp != nullptr)
-  {
-    log.print_cycle(g_slog.stamp_fp, extra);
-    std::fflush(g_slog.stamp_fp);
-  }
+  log.print_cycle(stdout, extra);
+  std::fflush(stdout);
 }
 
 enum class StageKind
@@ -261,37 +228,15 @@ std::string left_port_from_yaml(const std::string &path)
   return left;
 }
 
-bool parse_force_limits(const char *s, biped_hw::LimitParam &out)
-{
-  float p = 0.f;
-  float v = 0.f;
-  float t = 0.f;
-  if (s == nullptr || std::sscanf(s, "%f ,%f ,%f", &p, &v, &t) != 3)
-  {
-    return false;
-  }
-  if (p <= 0.1f || v <= 0.1f || t <= 0.1f)
-  {
-    return false;
-  }
-  out.q_max = p;
-  out.dq_max = v;
-  out.tau_max = t;
-  return true;
-}
 
 void usage()
 {
   g_slog.out(
-      "Usage: p2_dm_mit_ladder [options]\n"
-      "  P2 closed-loop ladder: position -> velocity -> torque (Damiao).\n"
-      "  Default --ctrl-mode mit is the original MIT ladder (CTRL_MODE=1, pack_mit).\n"
+      "Usage: p2_dm_test [options]\n"
+      "  P2 Damiao closed-loop test. Default --ctrl-mode mit (CTRL_MODE=1).\n"
+      "  Mode write / enable / set-zero / home are in dm_mit_host.\n"
       "  --port PATH           default /dev/ttyACM0 (CLI/default; map bus ignored)\n"
-      "  --can-id N            default %u; default ID must be mapped Damiao MIT,\n"
-      "                        Master 2. Explicit --can-id skips map vendor/joint\n"
-      "                        check (dump-rids and --stage). Enable still needs\n"
-      "                        RID 21/22/23. Testers MUST pass --can-id and --port:\n"
-      "                        default is CAN 12 on /dev/ttyACM0; mapped ID12 is ACM1.\n"
+      "  --can-id N            decimal slave ID (default kCanId=%u). 12 not 0x0C.\n"
       "  --period-ms MS        control period (default 10 = 100 Hz)\n"
       "  --ctrl-mode/--mode mit|pos_vel|vel|pos_force|auto\n"
       "                        mit (default): MIT frames on ESC_ID, CTRL_MODE=1.\n"
@@ -305,25 +250,20 @@ void usage()
       "                        dump-rids without --stage does not enable.\n"
       "                        all = pos then vel then torque (not dq).\n"
       "                        Stages that do not match --ctrl-mode are skipped.\n"
-      "                        Before MIT --stage motion: probe |q|; if |q|>%.3f rad\n"
-      "                        (kDmHomeEpsRad), speed-limited MIT return to 0 (kp=0,\n"
-      "                        kd=%.1f, dq_des=-sign(q)*%.0f rad/s, q_des=0 tau_ff=0)\n"
-      "                        until |q|<=eps, timeout max(%.0f, |q|/min(vel,%.0f)+%.0f) cap %.0f s,\n"
-      "                        or abort-tau. Then the stage. Fail → 0xFD, no\n"
-      "                        profile. Not dump-rids / --set-zero / --self-test.\n"
-      "                        Not 0xFE (that flag writes firmware zero).\n"
+      "                        Before MIT --stage: same home-to-zero as --home.\n"
+      "                        Fail → 0xFD, no profile. Not dump-rids / --set-zero\n"
+      "                        / --home / --self-test. Not 0xFE.\n"
       "  --pos-amp RAD         position amplitude (default 0.05 ~3 deg)\n"
-      "  --vel-amp RAD/S       vel stage ramp; dq: MIT dq_des rad/s up to VMAX\n"
+      "  --vel-amp RAD/S       vel stage sine peak speed; dq: MIT dq_des rad/s up to VMAX\n"
       "                        (default 0.5; host uses 5; not 5%% of VMAX)\n"
       "  --vel-stroke RAD      vel: |q_des-q0| window then vel_cmd=0 (default 0.2).\n"
       "                        dq: |q-q0| travel limit then disable 0xFD (not reverse).\n"
       "                        dq stroke cap is PMAX (several rad is legal; not 5%% PMAX).\n"
       "  --tau-amp NM          torque amplitude (default 0.5)\n"
-      "  --kp-pos --kd-pos     position stage gains (default 80 / 1.0, clamp kp<=200, kd<=5)\n"
+      "  --kp-pos --kd-pos     position stage gains (default 80 / 1.0, clamp kp<=500, kd<=5)\n"
       "  --kp-vel --kd-vel     vel stage MIT gains. Default: same as kp_pos / kd_pos.\n"
-      "                        --stage vel is a position ramp (not kd-only):\n"
-      "                        q_des += vel_cmd*dt, kp~80. Profile: +vel_amp, -vel_amp,\n"
-      "                        then vel=0 hold (~1/3 each).\n"
+      "                        --stage vel is a sinusoidal position track (not kd-only):\n"
+      "                        q_des=q0+vel-stroke*sin(phase), kp~80.\n"
       "                        --stage dq: host-like MIT: kp=0, kd from --kd-vel\n"
       "                        (else --kd-pos, e.g. 2), dq_des=--vel-amp rad/s up to\n"
       "                        VMAX (e.g. 5; not 5%% VMAX), q_des=0, tau from --tau-ff.\n"
@@ -331,42 +271,32 @@ void usage()
       "  --duration-pos SEC    position stage (default 5)\n"
       "  --duration-vel SEC    velocity / dq stage (default 8)\n"
       "  --duration-tau SEC    torque stage (default 3)\n"
-      "  --abort-tau NM        abort if |tau_fb| exceeds (default 15)\n"
+      "  --abort-tau NM        abort if |tau_fb| exceeds (default that motor TMAX)\n"
       "  --tau-ff NM           MIT t_ff on pos, vel, and dq stages (default 0, clamp 1%% TMAX)\n"
-      "  --force-limits P,V,T  override RID limits (knee only if RID fails)\n"
-      "  --dump-rids           RID hex dump even if RID 21/22/23 fail; no enable\n"
+      "  --dump-rids           RID hex dump (diagnostic). No enable unless --stage.\n"
       "                        unless --stage. No 0xFE write unless --set-zero.\n"
-      "                        Explicit --can-id skips motor-map vendor/joint\n"
-      "                        check. IDs>=10: if binary ESC (12=0x0C) gets no\n"
+      "                        IDs>=10: if binary ESC (12=0x0C) gets no\n"
       "                        REG RX, retry BCD 0x12.\n"
       "  --can-baud BPS        USB2CAN CAN bitrate (default 1000000 = 1 Mbps)\n"
       "  --handshake           optional USB2CAN CMD 0x02 after open (off by default)\n"
       "  --self-test           metrics math only, no hardware\n"
-      "  --verbose             per-cycle log to session file; console ~5 Hz\n"
-      "  --print-tx            hex dump command TX (console: first+edges; file: +verbose)\n"
+      "  --verbose             per-cycle console log\n"
+      "  --print-tx            hex dump command TX (first + edges)\n"
       "  --set-zero            WRITES firmware zero (current pos → motor zero),\n"
-      "                        MIT 0xFE. Does not run --stage motion. Mutually\n"
-      "                        exclusive with --stage. Requires explicit --can-id\n"
-      "                        and --port (defaults are the ID12-on-ACM0 trap).\n"
-      "                        No 0xFC; then 0xFD disable hygiene.\n"
-      "  Writes CTRL_MODE (RID 10) before enable. No flash save.\n"
-      "  Session log: /tmp/biped_hw_p2_last.log and data/p2_dm_mit_ladder_<ts>.log\n"
+      "                        MIT 0xFE via dm_send_set_zero. No --stage / --home.\n"
+      "                        Needs --port. No 0xFC; then 0xFD.\n"
+      "  --home                Enable MIT, then dm_home_to_zero (host-dq toward 0,\n"
+      "                        not 0xFE). No --stage / --set-zero. Needs --port.\n"
+      "                        Then 0xFD.\n"
       "  Single-motor bring-up. Port is --port / ACM0, not the map bus.\n"
       "  Never commands Motorevo HA60.\n",
-      static_cast<unsigned>(kDefaultEscId),
-      static_cast<double>(biped_hw::kDmHomeEpsRad),
-      static_cast<double>(biped_hw::kDmHomeKd),
-      static_cast<double>(biped_hw::kDmHomeVel),
-      static_cast<double>(biped_hw::kDmHomeTimeoutS),
-      static_cast<double>(biped_hw::kDmHomeVel),
-      static_cast<double>(biped_hw::kDmHomeTimeoutSlackS),
-      static_cast<double>(biped_hw::kDmHomeTimeoutMaxS));
+      static_cast<unsigned>(kCanId));
 }
 
 struct DisableGuard
 {
   biped_hw::UsbCanAdapter *adapter = nullptr;
-  uint8_t can_id = kDefaultEscId;
+  uint8_t can_id = kCanId;
   bool armed = false;
 
   void arm(biped_hw::UsbCanAdapter &a, uint8_t id)
@@ -531,8 +461,9 @@ bool read_rid_retries(biped_hw::UsbCanAdapter &adapter, biped_hw::FrameDemux &de
   return biped_hw::dm_read_rid(adapter, demux, esc_id, rid, value, print_xact ? &hook : nullptr);
 }
 
-bool write_rid_u32_retries(biped_hw::UsbCanAdapter &adapter, biped_hw::FrameDemux &demux,
-                           uint8_t esc_id, uint8_t rid, uint32_t value, bool print_xact)
+[[maybe_unused]] bool write_rid_u32_retries(biped_hw::UsbCanAdapter &adapter,
+                                             biped_hw::FrameDemux &demux, uint8_t esc_id,
+                                             uint8_t rid, uint32_t value, bool print_xact)
 {
   const biped_hw::DmXactHook hook = xact_hook(print_xact);
   return biped_hw::dm_write_rid_u32(adapter, demux, esc_id, rid, value,
@@ -772,23 +703,14 @@ MitCommand pos_command(double t, double duration, float q0, float amp)
   return c;
 }
 
-MitCommand vel_command(double t, double duration, float amp)
+MitCommand vel_command(double t, float amp, float stroke)
 {
-  // Square vel profile for the position ramp: +amp, -amp, then 0 (q_des frozen).
+  // Sinusoidal velocity for a sinusoidal position track.
   MitCommand c;
-  const double seg = duration / 3.0;
-  if (t < seg)
-  {
-    c.dq_des = amp;
-  }
-  else if (t < 2.0 * seg)
-  {
-    c.dq_des = -amp;
-  }
-  else
-  {
-    c.dq_des = 0.f;
-  }
+  const double omega = stroke > 1e-6f ? static_cast<double>(amp / stroke) : 0.0;
+  c.q_des = stroke * static_cast<float>(std::sin(omega * t));
+  c.dq_des = amp * static_cast<float>(std::cos(omega * t));
+  c.q = c.q_des;
   c.dq = c.dq_des;
   return c;
 }
@@ -870,7 +792,6 @@ bool run_stage(StageKind kind, biped_hw::UsbCanAdapter &adapter,
   bool printed_live_check = false;
   float wire_dq = 0.f;
   float q_des_int = q0;
-  const float dt = static_cast<float>(period_ms) * 0.001f;
 
   const float mit_kp = (kind == StageKind::Torque || kind == StageKind::Dq) ? 0.f : kp;
   const float mit_tau_ff = (kind == StageKind::Torque) ? 0.f : tau_ff;
@@ -888,7 +809,7 @@ bool run_stage(StageKind kind, biped_hw::UsbCanAdapter &adapter,
              biped_hw::dm_cmd_can_id(ctrl_mode, esc_id));
   if (kind == StageKind::Vel && ctrl_mode == biped_hw::kDmMitMode)
   {
-    g_slog.out("MIT vel: position ramp q_des += vel_cmd*dt  kp=%.1f kd=%.3f  "
+    g_slog.out("MIT vel: sinusoidal position track  kp=%.1f kd=%.3f  "
                "dq_des=±%.3f then 0  stroke=±%.3f rad  t_ff=%.3f\n",
                static_cast<double>(kp), static_cast<double>(kd),
                static_cast<double>(vel_amp), static_cast<double>(vel_stroke),
@@ -896,7 +817,7 @@ bool run_stage(StageKind kind, biped_hw::UsbCanAdapter &adapter,
   }
   if (kind == StageKind::Vel && ctrl_mode == biped_hw::kDmPosVelMode)
   {
-    g_slog.out("POS_VEL vel: position ramp q_des += vel_cmd*dt  v_des=|vel_cmd|  "
+    g_slog.out("POS_VEL vel: sinusoidal velocity profile  v_des=|vel_cmd|  "
                "stroke=±%.3f rad\n",
                static_cast<double>(vel_stroke));
   }
@@ -942,7 +863,7 @@ bool run_stage(StageKind kind, biped_hw::UsbCanAdapter &adapter,
       cmd.tau = tau_ff;
       break;
     case StageKind::Vel:
-      cmd = vel_command(elapsed, duration_s, vel_amp);
+      cmd = vel_command(elapsed, vel_amp, vel_stroke);
       cmd.kp = kp;
       cmd.kd = kd;
       cmd.tau = tau_ff;
@@ -992,25 +913,9 @@ bool run_stage(StageKind kind, biped_hw::UsbCanAdapter &adapter,
     {
       const float vlim = lim.dq_max * kLimitFracVel;
       float vel_cmd = clampf(cmd.dq_des, -vlim, vlim);
-      q_des_int += vel_cmd * dt;
-      const float q_lo = q0 - vel_stroke;
-      const float q_hi = q0 + vel_stroke;
-      if (q_des_int > q_hi)
-      {
-        q_des_int = q_hi;
-        if (vel_cmd > 0.f)
-        {
-          vel_cmd = 0.f;
-        }
-      }
-      else if (q_des_int < q_lo)
-      {
-        q_des_int = q_lo;
-        if (vel_cmd < 0.f)
-        {
-          vel_cmd = 0.f;
-        }
-      }
+      q_des_int = q0 + vel_stroke * static_cast<float>(
+                                   std::sin((vel_stroke > 1e-6f ? vel_amp / vel_stroke : 0.f) *
+                                            elapsed));
       cmd.q_des = q_des_int;
       cmd.q = q_des_int;
       cmd.dq_des = vel_cmd;
@@ -1225,10 +1130,9 @@ bool run_stage(StageKind kind, biped_hw::UsbCanAdapter &adapter,
     }
 
     const bool to_console =
-        printed < 3 || log.last_drop() ||
-        (t_rx - last_print) >= std::chrono::milliseconds(verbose ? 200 : 1000);
-    const bool to_file = verbose || to_console;
-    if (to_file)
+        verbose && (printed < 3 || log.last_drop() ||
+                    (t_rx - last_print) >= std::chrono::milliseconds(200));
+    if (to_console)
     {
       char extra[384];
       if (got)
@@ -1261,12 +1165,9 @@ bool run_stage(StageKind kind, biped_hw::UsbCanAdapter &adapter,
       {
         std::snprintf(extra, sizeof(extra), "no reply period_us=%.0f", period_us);
       }
-      print_cycle_tee(log, extra, to_console);
-      if (to_console)
-      {
-        last_print = t_rx;
-        ++printed;
-      }
+      print_cycle_tee(log, extra, true);
+      last_print = t_rx;
+      ++printed;
     }
 
     const auto remain = next - Clock::now();
@@ -1346,9 +1247,6 @@ void print_end_banner(const CtrlModeState &cm, bool tau_ff_set, float tau_ff_use
       (cm.after_ok && cm.after == biped_hw::kDmMitMode) ||
       (cm.end_ok && cm.end == biped_hw::kDmMitMode);
   g_slog.out("\n========== P2 END BANNER (scroll-safe) ==========\n");
-  g_slog.out("session_log last : %s\n", g_slog.last_path.c_str());
-  g_slog.out("session_log stamp: %s\n",
-             g_slog.stamp_path.empty() ? "(none)" : g_slog.stamp_path.c_str());
   if (tau_ff_set)
   {
     g_slog.out("tau_ff: USED --tau-ff user=%.3f Nm  applied=%.3f Nm  cap(1%% TMAX)=%.3f Nm\n",
@@ -1480,9 +1378,8 @@ void refresh_ctrl_mode_end(biped_hw::UsbCanAdapter &adapter, biped_hw::FrameDemu
                            uint8_t esc_id, CtrlModeState &cm)
 {
   float f = 0.f;
-  g_slog.out("CTRL_MODE RID10 last read (end banner):\n");
   cm.end_ok = read_rid_retries(adapter, demux, esc_id,
-                               static_cast<uint8_t>(biped_hw::DmRid::CtrlMode), f, true);
+                               static_cast<uint8_t>(biped_hw::DmRid::CtrlMode), f, false);
   cm.end = static_cast<uint32_t>(f + 0.5f);
   g_slog.out("CTRL_MODE RID10 last: %s%u (%s)\n", cm.end_ok ? "" : "FAIL ",
              static_cast<unsigned>(cm.end), mode_ok_str(cm.end_ok, cm.end));
@@ -1616,87 +1513,45 @@ const char *stage_kind_name(StageKind kind)
 }
 
 bool write_ctrl_mode_and_enable(biped_hw::UsbCanAdapter &adapter, biped_hw::FrameDemux &demux,
-                                uint8_t esc_id, uint32_t want, const biped_hw::LimitParam &lim,
+                                uint8_t esc_id, uint32_t want, const biped_hw::LimitParam &,
                                 CtrlModeState &cm)
 {
-  biped_hw::dm_send_disable(adapter, esc_id);
-  usleep(kDisableGapUs);
-
-  uint8_t dis_err = 0xFF;
-  bool got_dis_fb = false;
-  const auto dis_deadline =
-      std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
-  while (std::chrono::steady_clock::now() < dis_deadline)
-  {
-    biped_hw::CanRxFrame rx;
-    if (!adapter.pollCan(rx))
-    {
-      continue;
-    }
-    demux.push(rx);
-    biped_hw::DmFeedback fb{};
-    if (demux.take_mit(esc_id, lim, fb))
-    {
-      dis_err = fb.err;
-      got_dis_fb = true;
-      break;
-    }
-  }
-  g_slog.out("disable before CTRL_MODE: fb.err=%s%u (%s)\n", got_dis_fb ? "" : "NONE ",
-             static_cast<unsigned>(got_dis_fb ? dis_err : 0),
-             !got_dis_fb ? "no feedback" : (dis_err == 0 ? "DISABLED" : "still enabled/fault"));
-  adapter.drain();
-  demux.clear();
-
-  g_slog.out("CTRL_MODE RID10 read before write:\n");
-  float mode_f = 0.f;
-  const bool before_ok =
-      read_rid_retries(adapter, demux, esc_id,
-                       static_cast<uint8_t>(biped_hw::DmRid::CtrlMode), mode_f, true);
-  const uint32_t before = static_cast<uint32_t>(mode_f + 0.5f);
+  biped_hw::DmMitEnableStatus st{};
+  const auto err = biped_hw::dm_enable_mode(adapter, demux, esc_id, want, st);
   if (!cm.before_ok)
   {
-    cm.before_ok = before_ok;
-    cm.before = before;
+    cm.before_ok = st.ctrl_before_ok;
+    cm.before = st.ctrl_before;
   }
-  g_slog.out("CTRL_MODE RID10 before write: %s%u (%s)  want %u (%s)\n",
-             before_ok ? "" : "FAIL ", static_cast<unsigned>(before),
-             mode_ok_str(before_ok, before), static_cast<unsigned>(want),
-             biped_hw::dm_ctrl_mode_name(want));
-
-  g_slog.out("CTRL_MODE RID10 write %s (0x7FF / 0x55 / RID=10 / u32 LE=%u):\n",
-             biped_hw::dm_ctrl_mode_name(want), static_cast<unsigned>(want));
   cm.write_attempted = true;
-  cm.wrote_ack = write_rid_u32_retries(adapter, demux, esc_id,
-                                       static_cast<uint8_t>(biped_hw::DmRid::CtrlMode),
-                                       want, true);
-  usleep(20000);
-  mode_f = 0.f;
-  g_slog.out("CTRL_MODE RID10 read after write:\n");
-  cm.after_ok =
-      read_rid_retries(adapter, demux, esc_id,
-                       static_cast<uint8_t>(biped_hw::DmRid::CtrlMode), mode_f, true);
-  cm.after = static_cast<uint32_t>(mode_f + 0.5f);
-  cm.end_ok = cm.after_ok;
-  cm.end = cm.after;
-  g_slog.out("CTRL_MODE RID10 write %s: %s  after: %s%u (%s)\n",
-             biped_hw::dm_ctrl_mode_name(want), cm.wrote_ack ? "ack" : "NO-ACK",
-             cm.after_ok ? "" : "FAIL ", static_cast<unsigned>(cm.after),
-             mode_ok_str(cm.after_ok, cm.after));
-  if (!cm.after_ok || cm.after != want)
+  cm.wrote_ack = st.wrote_ack;
+  cm.after_ok = st.ctrl_after_ok;
+  cm.after = st.ctrl_after;
+  cm.end_ok = st.ctrl_after_ok;
+  cm.end = st.ctrl_after;
+  g_slog.out("CTRL_MODE RID10 before write: %s%u (%s)  want %u (%s)\n",
+             st.ctrl_before_ok ? "" : "FAIL ", static_cast<unsigned>(st.ctrl_before),
+             mode_ok_str(st.ctrl_before_ok, st.ctrl_before), static_cast<unsigned>(want),
+             biped_hw::dm_ctrl_mode_name(want));
+  g_slog.out("CTRL_MODE RID10 write %s via dm_enable_mode: %s  after: %s%u (%s)\n",
+             biped_hw::dm_ctrl_mode_name(want), st.wrote_ack ? "ack" : "NO-ACK",
+             st.ctrl_after_ok ? "" : "FAIL ", static_cast<unsigned>(st.ctrl_after),
+             mode_ok_str(st.ctrl_after_ok, st.ctrl_after));
+  if (err != biped_hw::DmMitEnableErr::Ok)
   {
-    g_slog.err(
-        "REFUSE enable: CTRL_MODE %s%u (%s), need %u (%s). Command frames for this "
-        "mode would be ignored (feedback may still reply).\n",
-        cm.after_ok ? "" : "FAIL ", static_cast<unsigned>(cm.after),
-        mode_ok_str(cm.after_ok, cm.after), static_cast<unsigned>(want),
-        biped_hw::dm_ctrl_mode_name(want));
-    return false;
-  }
-
-  if (!biped_hw::dm_send_enable(adapter, esc_id))
-  {
-    g_slog.err("enable send failed\n");
+    if (err == biped_hw::DmMitEnableErr::EnableTx)
+    {
+      g_slog.err("enable send failed\n");
+    }
+    else
+    {
+      g_slog.err(
+          "REFUSE enable: CTRL_MODE %s%u (%s), need %u (%s). Command frames for this "
+          "mode would be ignored (feedback may still reply).\n",
+          st.ctrl_after_ok ? "" : "FAIL ", static_cast<unsigned>(st.ctrl_after),
+          mode_ok_str(st.ctrl_after_ok, st.ctrl_after), static_cast<unsigned>(want),
+          biped_hw::dm_ctrl_mode_name(want));
+    }
     return false;
   }
   g_slog.out("enable id=%u sent (0xFC)  CTRL_MODE=%s\n", static_cast<unsigned>(esc_id),
@@ -1728,7 +1583,7 @@ void pack_q0_probe(uint8_t cmd[8], uint32_t ctrl_mode, uint8_t esc_id, uint32_t 
 struct Options
 {
   int period_ms = 10;
-  uint8_t esc_id = kDefaultEscId;
+  uint8_t esc_id = kCanId;
   std::string port = biped_hw::kDefaultPortLeft;
   std::string yaml_path;
   bool handshake = false;
@@ -1737,12 +1592,10 @@ struct Options
   bool print_tx = false;
   bool dump_rids = false;
   bool set_zero = false;
+  bool home = false;
   uint32_t can_bitrate = biped_hw::UsbCanAdapter::kDefaultCanBitrate;
   bool stage_set = false;
-  bool can_id_set = false;
   bool port_set = false;
-  bool have_force_limits = false;
-  biped_hw::LimitParam force_lim{};
   bool do_pos = true;
   bool do_vel = true;
   bool do_tau = true;
@@ -1760,7 +1613,7 @@ struct Options
   double duration_pos = 5.0;
   double duration_vel = 8.0;
   double duration_tau = 3.0;
-  float abort_tau = 15.f;
+  float abort_tau = 0.f;  // 0 = motor TMAX after RID
   float tau_ff = 0.f;
   float tau_ff_user = 0.f;
   bool tau_ff_set = false;
@@ -1793,14 +1646,14 @@ bool parse_args(int argc, char **argv, Options &opt, std::string &err)
       {
         return false;
       }
-      const int id = std::atoi(v);
-      if (id < 0 || id > 255)
+      char *end = nullptr;
+      const unsigned long id = std::strtoul(v, &end, 10);
+      if (end == v || end == nullptr || *end != '\0' || id < 1 || id > 127)
       {
-        err = "--can-id out of range";
+        err = "--can-id is decimal 1–127 (12, not 0x0C)";
         return false;
       }
       opt.esc_id = static_cast<uint8_t>(id);
-      opt.can_id_set = true;
     }
     else if (std::strcmp(argv[i], "--port") == 0)
     {
@@ -1940,6 +1793,11 @@ bool parse_args(int argc, char **argv, Options &opt, std::string &err)
         return false;
       }
       opt.abort_tau = std::strtof(v, nullptr);
+      if (!(opt.abort_tau > 0.f))
+      {
+        err = "--abort-tau must be > 0";
+        return false;
+      }
     }
     else if (std::strcmp(argv[i], "--tau-ff") == 0)
     {
@@ -1979,6 +1837,10 @@ bool parse_args(int argc, char **argv, Options &opt, std::string &err)
     {
       opt.set_zero = true;
     }
+    else if (std::strcmp(argv[i], "--home") == 0)
+    {
+      opt.home = true;
+    }
     else if (std::strcmp(argv[i], "--can-baud") == 0)
     {
       const char *v = need("--can-baud");
@@ -1987,20 +1849,6 @@ bool parse_args(int argc, char **argv, Options &opt, std::string &err)
         return false;
       }
       opt.can_bitrate = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
-    }
-    else if (std::strcmp(argv[i], "--force-limits") == 0)
-    {
-      const char *v = need("--force-limits");
-      if (v == nullptr)
-      {
-        return false;
-      }
-      if (!parse_force_limits(v, opt.force_lim))
-      {
-        err = "--force-limits needs PMAX,VMAX,TMAX (all > 0.1)";
-        return false;
-      }
-      opt.have_force_limits = true;
     }
     else if (std::strcmp(argv[i], "--handshake") == 0)
     {
@@ -2030,14 +1878,24 @@ bool parse_args(int argc, char **argv, Options &opt, std::string &err)
       return false;
     }
   }
+  if (opt.set_zero && opt.home)
+  {
+    err = "refuse: --set-zero cannot be combined with --home";
+    return false;
+  }
   if (opt.set_zero && opt.stage_set)
   {
     err = "refuse: --set-zero cannot be combined with --stage";
     return false;
   }
-  if (opt.set_zero && (!opt.can_id_set || !opt.port_set))
+  if (opt.home && opt.stage_set)
   {
-    err = "--set-zero requires --can-id and --port";
+    err = "refuse: --home cannot be combined with --stage";
+    return false;
+  }
+  if ((opt.set_zero || opt.home) && !opt.port_set)
+  {
+    err = "--set-zero/--home require --port";
     return false;
   }
   return true;
@@ -2078,12 +1936,10 @@ int run(Options opt, int argc, char **argv)
   bool print_tx = opt.print_tx;
   bool dump_rids = opt.dump_rids;
   bool set_zero = opt.set_zero;
+  bool home = opt.home;
   uint32_t can_bitrate = opt.can_bitrate;
   bool stage_set = opt.stage_set;
-  bool can_id_set = opt.can_id_set;
   bool port_set = opt.port_set;
-  bool have_force_limits = opt.have_force_limits;
-  biped_hw::LimitParam force_lim = opt.force_lim;
   bool do_pos = opt.do_pos;
   bool do_vel = opt.do_vel;
   bool do_tau = opt.do_tau;
@@ -2116,13 +1972,7 @@ int run(Options opt, int argc, char **argv)
   float tau_cap = 0.f;
 
   SessionLogGuard slog_guard;
-  if (!g_slog.open())
-  {
-    g_slog.err("WARN: could not open session log (%s)\n", g_slog.last_path.c_str());
-  }
-  g_slog.out("session_log last : %s\n", g_slog.last_path.c_str());
-  g_slog.out("session_log stamp: %s\n",
-             g_slog.stamp_path.empty() ? "(none)" : g_slog.stamp_path.c_str());
+  (void)g_slog.open();
   g_slog.out("cmdline:");
   for (int ai = 0; ai < argc; ++ai)
   {
@@ -2146,28 +1996,14 @@ int run(Options opt, int argc, char **argv)
     return 0;
   }
 
-  // P2 is a single-motor bring-up tool. Default ID (no --can-id) must be amapped Damiao MIT (Master 2). 
-  // Explicit --can-id skips the map vendor/joint check for dump-rids AND
   const auto *entry = biped_hw::find_by_can_id(esc_id);
-
-  const bool map_ok = entry != nullptr && entry->master_id == biped_hw::kMasterId &&
-                      biped_hw::is_damiao_mit(entry->model);
-  if (!map_ok)
+  if (entry == nullptr || entry->master_id != biped_hw::kMasterId ||
+      !biped_hw::is_damiao_mit(entry->model))
   {
-    if (can_id_set)
-    {
-      g_slog.out(
-          "NOTE: --can-id set; skipping motor-map vendor/joint check for CAN ID %u "
-          "(unmapped or not Damiao MIT). Enable still requires RID 21/22/23.\n",
-          static_cast<unsigned>(esc_id));
-    }
-    else
-    {
-      g_slog.err(
-          "motor map mismatch for CAN ID %u (need mapped Damiao MIT, Master 2)\n",
-          static_cast<unsigned>(esc_id));
-      return 1;
-    }
+    g_slog.err(
+        "motor map mismatch for CAN ID %u (need mapped Damiao MIT, Master 2)\n",
+        static_cast<unsigned>(esc_id));
+    return 1;
   }
 
   if (!yaml_path.empty() && !port_set)
@@ -2271,6 +2107,19 @@ int run(Options opt, int argc, char **argv)
         entry != nullptr ? biped_hw::to_string(entry->model) : "unmapped",
         entry != nullptr ? biped_hw::to_string(entry->joint) : "probe");
   }
+  else if (home)
+  {
+    g_slog.out(
+        "\n"
+        "**********************************************************************\n"
+        "* --home: enable MIT, dm_home_to_zero toward firmware 0, then 0xFD. *\n"
+        "* Not 0xFE. Abort if |tau_fb| > %.1f Nm.                            *\n"
+        "**********************************************************************\n"
+        "port %s  CAN ID %u (%s %s)\n",
+        static_cast<double>(abort_tau), port.c_str(), static_cast<unsigned>(esc_id),
+        entry != nullptr ? biped_hw::to_string(entry->model) : "unmapped",
+        entry != nullptr ? biped_hw::to_string(entry->joint) : "probe");
+  }
   else
   {
     g_slog.out(
@@ -2285,7 +2134,7 @@ int run(Options opt, int argc, char **argv)
         "pos_amp=%.3f rad  vel_amp=%.2f rad/s  vel_stroke=%.3f rad  tau_amp=%.2f Nm  "
         "tau_ff=%.3f Nm\n"
         "kp_pos=%.1f kd_pos=%.2f  (MIT tau_est~kp*pos_amp+tau_ff=%.2f Nm)\n"
-        "vel MIT/POS_VEL: kp=%.1f kd=%.2f (default=pos gains)  position ramp, stroke=±%.3f rad\n"
+        "vel MIT/POS_VEL: kp=%.1f kd=%.2f (default=pos gains)  sinusoidal track, stroke=±%.3f rad\n"
         "dq MIT / VEL: kp=0 kd=%.2f  dq_des=+%.3f  stroke=±%.3f then 0xFD\n"
         "MIT formula: tau=kp*(q_des-q)+kd*(dq_des-dq)+t_ff ; kp is Nm/rad, NOT *TMAX/PMAX.\n",
         static_cast<double>(abort_tau), port.c_str(), static_cast<unsigned>(esc_id),
@@ -2398,79 +2247,71 @@ int run(Options opt, int argc, char **argv)
     return 0;
   }
 
-  biped_hw::LimitParam lim{};
-  const char *lim_src = "unset";
+  const biped_hw::LimitParam lim = biped_hw::default_limit(entry->model);
+  const char *lim_src = "table";
   biped_hw::FrameDemux demux;
-
-  float pmax = 0.f, vmax = 0.f, tmax = 0.f;
   adapter.drain();
   adapter.reset_rx_stats();
-  const bool print_rid_xact = verbose || dump_rids;
-  const bool pok =
-      read_rid_retries(adapter, demux, esc_id,
-                       static_cast<uint8_t>(biped_hw::DmRid::Pmax), pmax, print_rid_xact);
-  const bool vok =
-      read_rid_retries(adapter, demux, esc_id,
-                       static_cast<uint8_t>(biped_hw::DmRid::Vmax), vmax, print_rid_xact);
-  const bool tok =
-      read_rid_retries(adapter, demux, esc_id,
-                       static_cast<uint8_t>(biped_hw::DmRid::Tmax), tmax, print_rid_xact);
-  g_slog.out("RID 21/22/23 PMAX=%s%.4f VMAX=%s%.4f TMAX=%s%.4f\n", pok ? "" : "FAIL ",
-              static_cast<double>(pmax), vok ? "" : "FAIL ",
-              static_cast<double>(vmax), tok ? "" : "FAIL ",
-              static_cast<double>(tmax));
-  print_usbcan_rx_stats(adapter, "after RID 21/22/23");
-
-  const bool rid_ok = pok && vok && tok && pmax > 0.1f && vmax > 0.1f && tmax > 0.1f;
-  if (rid_ok)
+  if (abort_tau <= 0.f)
   {
-    lim.q_max = pmax;
-    lim.dq_max = vmax;
-    lim.tau_max = tmax;
-    lim_src = "RID 21/22/23";
-  }
-  else if (have_force_limits)
-  {
-    lim = force_lim;
-    lim_src = "--force-limits";
-    g_slog.out("WARN: RID read failed; using --force-limits.\n");
+    abort_tau = lim.tau_max > 0.1f ? lim.tau_max : biped_hw::peak_tau_nm(esc_id);
   }
 
-  // --dump-rids must run even when RID 21/22/23 fail (otherwise TX/RX is silent).
-  if (rid_ok || dump_rids)
+  if (dump_rids)
   {
     dump_diag_rids(adapter, demux, esc_id, /*print_xact=*/true);
     print_usbcan_rx_stats(adapter, "after dump-rids");
   }
-  if (dump_rids && !stage_set)
+  if (dump_rids && !stage_set && !home)
   {
-    g_slog.out("--dump-rids done (no enable; pass --stage to continue).\n");
+    g_slog.out("--dump-rids done (no enable; pass --stage or --home to continue).\n");
     refresh_ctrl_mode_end(adapter, demux, esc_id, cm);
     print_usbcan_rx_stats(adapter, "end");
     print_end_banner(cm, tau_ff_set, tau_ff_user, tau_ff, tau_cap, q0, have_q0, results);
     guard.disable_now();
     g_exit_adapter = nullptr;
     adapter.close();
-    return rid_ok ? 0 : 1;
+    return 0;
   }
   if (dump_rids && stage_set)
   {
     g_slog.out("--dump-rids: hex dump done, continuing because --stage is set.\n");
   }
 
-  if (!rid_ok && !have_force_limits)
+  if (home)
   {
-    g_slog.err(
-        "REFUSE enable: knee DM10422 CAN %u limits UNVERIFIED (RID 21/22/23 failed).\n"
-        "Retry on live bus or pass --force-limits PMAX,VMAX,TMAX.\n",
-        static_cast<unsigned>(esc_id));
+    if (!write_ctrl_mode_and_enable(adapter, demux, esc_id, biped_hw::kDmMitMode, lim, cm))
+    {
+      refresh_ctrl_mode_end(adapter, demux, esc_id, cm);
+      print_end_banner(cm, tau_ff_set, tau_ff_user, tau_ff, tau_cap, q0, have_q0, results);
+      guard.disable_now();
+      g_exit_adapter = nullptr;
+      adapter.close();
+      return 1;
+    }
+    biped_hw::DmHomeStatus hs{};
+    const auto hr = biped_hw::dm_home_to_zero(
+        adapter, demux, esc_id, lim, abort_tau, biped_hw::kDmHomeTimeoutS,
+        biped_hw::kDmHomeEpsRad, &hs);
+    if (hr != biped_hw::DmHomeResult::ProbeFail)
+    {
+      q0 = hs.q_after;
+      have_q0 = true;
+    }
+    g_slog.out("home id=%u q_before=%.4f %s q_after=%.4f eps=%.3f tau_peak=%.3f\n",
+               static_cast<unsigned>(esc_id), static_cast<double>(hs.q_before),
+               biped_hw::dm_home_result_name(hr), static_cast<double>(hs.q_after),
+               static_cast<double>(biped_hw::kDmHomeEpsRad),
+               static_cast<double>(hs.tau_peak));
     refresh_ctrl_mode_end(adapter, demux, esc_id, cm);
-    print_usbcan_rx_stats(adapter, "end");
     print_end_banner(cm, tau_ff_set, tau_ff_user, tau_ff, tau_cap, q0, have_q0, results);
-    return 1;
+    guard.disable_now();
+    g_exit_adapter = nullptr;
+    adapter.close();
+    return biped_hw::dm_home_ok(hr) ? 0 : 1;
   }
 
-  // Clamp user amplitudes to safe fractions of verified limits.
+  // Clamp user amplitudes to safe fractions of the table limits.
   // --stage dq matches Damiao 上位机: dq_des up to VMAX (e.g. 5), not 5% VMAX.
   const float pos_cap = lim.q_max * kLimitFracPos;
   const float vel_cap = do_dq ? lim.dq_max : (lim.dq_max * kLimitFracVel);
@@ -2547,7 +2388,7 @@ int run(Options opt, int argc, char **argv)
   }
   else
   {
-    g_slog.out("MIT/POS_VEL vel: position ramp  kp=%.1f kd=%.3f  dq_des=±%.3f rad/s  "
+    g_slog.out("MIT/POS_VEL vel: sinusoidal track  kp=%.1f kd=%.3f  dq_peak=±%.3f rad/s  "
                "stroke=±%.3f rad  t_ff=%.3f\n",
                static_cast<double>(vel_kp), static_cast<double>(vel_kd),
                static_cast<double>(vel_amp), static_cast<double>(vel_stroke),

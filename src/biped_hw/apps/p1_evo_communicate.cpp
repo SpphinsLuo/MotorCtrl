@@ -1,7 +1,5 @@
-//泉智博电机通信测试程序
-// P1 Motorevo 关：左踝 Roll HA60，仅 CAN 8 / 左 USB2CAN / Master 2。
-// 伺服保持（保守增益），使能 0xFC、失能 0xFD。发送后单独 poll，禁止 send 内 receive。
-// 回包可能走从站 ID 8 或 Master 0x02。不向达妙 CAN 3–7（含 6）发任何命令。
+// 泉智博电机通信测试程序
+// P1：HA60 通信/使能。CAN ID = kCanId，改完重新编译；无 --can-id。
 #include "biped_hw/cli.hpp"
 #include "biped_hw/cycle_logger.hpp"
 #include "biped_hw/frame_demux.hpp"
@@ -25,7 +23,8 @@
 namespace
 {
 
-constexpr uint8_t kEscId = 8;
+// Edit kCanId and rebuild. Must be mapped Motorevo HA60, Master 2.
+constexpr uint8_t kCanId = 8;
 constexpr int kEnableSettleUs = 100000;
 constexpr int kDisableGapUs = 10000;
 constexpr float kDefaultPosKp = 8.f;
@@ -49,9 +48,9 @@ void atexit_disable()
   }
   uint8_t buf[8] = {};
   biped_hw::pack_motorevo_disable(buf);
-  g_exit_adapter->sendCan(kEscId, buf, 8);
+  g_exit_adapter->sendCan(kCanId, buf, 8);
   usleep(kDisableGapUs);
-  g_exit_adapter->sendCan(kEscId, buf, 8);
+  g_exit_adapter->sendCan(kCanId, buf, 8);
 }
 
 std::string left_port_from_yaml(const std::string &path)
@@ -67,7 +66,7 @@ std::string left_port_from_yaml(const std::string &path)
 
 struct SessionLog
 {
-  std::string last_path{"/tmp/biped_hw_p1_evo_id8_last.log"};
+  std::string last_path{"/home/ye/00_jfl_26.10/MotorCtrl/log/biped_hw_p1_evo_last.log"};
   std::string stamp_path;
   std::FILE *last_fp = nullptr;
   std::FILE *stamp_fp = nullptr;
@@ -127,7 +126,6 @@ struct SessionLog
   bool open()
   {
     std::error_code ec;
-    std::filesystem::create_directories("/home/ye/00_jfl_26.10/data", ec);
     std::filesystem::create_directories("/home/ye/00_jfl_26.10/MotorCtrl/log", ec);
 
     std::time_t now = std::time(nullptr);
@@ -137,13 +135,8 @@ struct SessionLog
     std::strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tm);
 
     last_fp = std::fopen(last_path.c_str(), "w");
-    stamp_path = std::string("/home/ye/00_jfl_26.10/data/p1_left_evo_id8_") + ts + ".log";
+    stamp_path = std::string("/home/ye/00_jfl_26.10/MotorCtrl/log/p1_evo_communicate_") + ts + ".log";
     stamp_fp = std::fopen(stamp_path.c_str(), "w");
-    if (stamp_fp == nullptr)
-    {
-      stamp_path = std::string("/home/ye/00_jfl_26.10/MotorCtrl/log/p1_left_evo_id8_") + ts + ".log";
-      stamp_fp = std::fopen(stamp_path.c_str(), "w");
-    }
     return last_fp != nullptr || stamp_fp != nullptr;
   }
 
@@ -185,14 +178,15 @@ void print_cycle_tee(const biped_hw::CycleLogger &log, const char *extra)
 void usage()
 {
   std::printf(
-      "Usage: p1_left_evo_id8 [--duration SEC] [--period-ms MS] [--port PATH]\n"
+      "Usage: p1_evo_communicate [--duration SEC] [--period-ms MS] [--port PATH]\n"
       "                       [--kp POS_KP] [--kd POS_KD] [--yaml PATH]\n"
       "                       [--handshake] [--self-test] [--verbose]\n"
-      "Left USB-CAN only. Hard-locked CAN ID 8 Motorevo HA60 ankle roll, Master 2.\n"
-      "Default servo mode (not mix). Enable 0xFC, disable 0xFD (same as lab HA60).\n"
-      "Feedback may arrive on slave CAN 8 or Master 0x02; both are accepted.\n"
+      "CAN ID is kCanId in this file (edit and rebuild). Must be mapped HA60,\n"
+      "Master 2. No --can-id. Default port is left USB-CAN.\n"
+      "Default servo mode (not mix). Enable 0xFC, disable 0xFD.\n"
+      "Feedback may arrive on slave CAN or Master 0x02; both are accepted.\n"
       "Conservative servo hold at current/zero. Motor may twitch. Disable on exit.\n"
-      "Never opens the right adapter. Never commands Damiao IDs (do not enable CAN 6).\n");
+      "Never commands Damiao MIT motors.\n");
 }
 
 struct DisableGuard
@@ -214,11 +208,11 @@ struct DisableGuard
     }
     uint8_t buf[8] = {};
     biped_hw::pack_motorevo_disable(buf);
-    adapter->sendCan(kEscId, buf, 8);
+    adapter->sendCan(kCanId, buf, 8);
     usleep(kDisableGapUs);
-    adapter->sendCan(kEscId, buf, 8);
+    adapter->sendCan(kCanId, buf, 8);
     usleep(kDisableGapUs);
-    g_slog.out("disable id=%u sent (0xFD)\n", static_cast<unsigned>(kEscId));
+    g_slog.out("disable id=%u sent (0xFD)\n", static_cast<unsigned>(kCanId));
     armed = false;
   }
 
@@ -241,10 +235,10 @@ bool demux_self_check()
   };
 
   biped_hw::CanRxFrame slave{};
-  fill_mid(slave, 8);
+  fill_mid(slave, kCanId);
   demux.push(slave);
   biped_hw::MotorevoFeedback fb{};
-  if (!demux.take_motorevo(kEscId, fb) || fb.rx_can_id != 8)
+  if (!demux.take_motorevo(kCanId, fb) || fb.rx_can_id != kCanId)
   {
     return false;
   }
@@ -252,7 +246,7 @@ bool demux_self_check()
   biped_hw::CanRxFrame master{};
   fill_mid(master, biped_hw::kMasterId);
   demux.push(master);
-  if (!demux.take_motorevo(kEscId, fb) || fb.rx_can_id != biped_hw::kMasterId)
+  if (!demux.take_motorevo(kCanId, fb) || fb.rx_can_id != biped_hw::kMasterId)
   {
     return false;
   }
@@ -261,7 +255,7 @@ bool demux_self_check()
   fill_mid(dm, biped_hw::kMasterId);
   dm.data[0] = 0x16;  // Damiao-looking: ERR=1 ESC=6
   demux.push(dm);
-  if (demux.take_motorevo(kEscId, fb))
+  if (demux.take_motorevo(kCanId, fb))
   {
     return false;
   }
@@ -383,12 +377,12 @@ int main(int argc, char **argv)
     return 0;
   }
 
-  const auto *entry = biped_hw::find_by_can_id(kEscId);
-  if (entry == nullptr || entry->bus != biped_hw::BusId::Left ||
-      entry->master_id != biped_hw::kMasterId || entry->model != biped_hw::MotorType::HA60)
+  const auto *entry = biped_hw::find_by_can_id(kCanId);
+  if (entry == nullptr || entry->master_id != biped_hw::kMasterId ||
+      entry->model != biped_hw::MotorType::HA60)
   {
-    std::fprintf(stderr, "motor map mismatch for CAN ID %u (need left-bus HA60, Master 2)\n",
-                 static_cast<unsigned>(kEscId));
+    std::fprintf(stderr, "motor map mismatch for CAN ID %u (need mapped HA60, Master 2)\n",
+                 static_cast<unsigned>(kCanId));
     return 1;
   }
 
@@ -443,9 +437,9 @@ int main(int argc, char **argv)
       "      feedback on slave CAN %u OR Master %u; print rx_id each cycle\n"
       "      servo pos_kp=%.2f pos_kd=%.2f vel_kp/kd/ki=0  duration=%.1fs period=%dms\n"
       "      right adapter unused; Damiao CAN 3-7 (including 6) not commanded.\n",
-      port.c_str(), static_cast<unsigned>(kEscId), biped_hw::to_string(entry->joint),
+      port.c_str(), static_cast<unsigned>(kCanId), biped_hw::to_string(entry->joint),
       biped_hw::to_string(entry->model), static_cast<unsigned>(entry->master_id),
-      static_cast<unsigned>(kEscId), static_cast<unsigned>(biped_hw::kMasterId),
+      static_cast<unsigned>(kCanId), static_cast<unsigned>(biped_hw::kMasterId),
       static_cast<double>(pos_kp), static_cast<double>(pos_kd), duration_s, period_ms);
   g_slog.out("session_log last : %s\n", g_slog.last_path.c_str());
   g_slog.out("session_log stamp: %s\n",
@@ -485,13 +479,13 @@ int main(int argc, char **argv)
   adapter.drain();
   uint8_t cmd[8] = {};
   biped_hw::pack_motorevo_enable(cmd);
-  if (!adapter.sendCan(kEscId, cmd, 8))
+  if (!adapter.sendCan(kCanId, cmd, 8))
   {
     g_slog.err("enable send failed\n");
     g_slog.close();
     return 1;
   }
-  g_slog.out("enable id=%u sent (0xFC)\n", static_cast<unsigned>(kEscId));
+  g_slog.out("enable id=%u sent (0xFC)\n", static_cast<unsigned>(kCanId));
   usleep(kEnableSettleUs);
   adapter.drain();
 
@@ -515,12 +509,12 @@ int main(int argc, char **argv)
     // Servo only. Mix pack lives in motorevo_codec.hpp; this app does not switch.
     biped_hw::pack_motorevo_servo(cmd, q_cmd, pos_kp, pos_kd, 0.f, 0.f, 0.f, 0.f);
     const auto t_send = biped_hw::CycleLogger::Clock::now();
-    if (!adapter.sendCan(kEscId, cmd, 8))
+    if (!adapter.sendCan(kCanId, cmd, 8))
     {
       g_slog.err("servo send failed; disabling\n");
       break;
     }
-    log.on_send(kEscId, kEscId, t_send);
+    log.on_send(kCanId, kCanId, t_send);
 
     biped_hw::MotorevoFeedback fb{};
     bool got = false;
@@ -530,9 +524,9 @@ int main(int argc, char **argv)
       if (adapter.pollCan(rx))
       {
         demux.push(rx);
-        if (demux.take_motorevo(kEscId, fb))
+        if (demux.take_motorevo(kCanId, fb))
         {
-          log.on_rx(kEscId, fb.rx_can_id, biped_hw::CycleLogger::Clock::now());
+          log.on_rx(kCanId, fb.rx_can_id, biped_hw::CycleLogger::Clock::now());
           got = true;
           break;
         }
@@ -540,13 +534,13 @@ int main(int argc, char **argv)
     }
     if (!got)
     {
-      log.on_timeout(kEscId);
+      log.on_timeout(kCanId);
     }
     else
     {
       q_hold = fb.q;
       have_q = true;
-      if (fb.rx_can_id == kEscId)
+      if (fb.rx_can_id == kCanId)
       {
         ++rx_on_slave;
       }
@@ -576,7 +570,7 @@ int main(int argc, char **argv)
       {
         std::snprintf(extra, sizeof(extra),
                       "no Motorevo reply on id=%u or Master %u (hold_q=%.4f)",
-                      static_cast<unsigned>(kEscId),
+                      static_cast<unsigned>(kCanId),
                       static_cast<unsigned>(biped_hw::kMasterId),
                       static_cast<double>(q_hold));
       }

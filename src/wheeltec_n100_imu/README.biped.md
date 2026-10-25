@@ -3,17 +3,8 @@
 独立 ROS 2 包，路径：`motorctrl/src/wheeltec_n100_imu`（不要放进 `biped_hw`）。
 上游：https://github.com/NDHANA94/ros2_wheeltec_n100_imu
 
-## 串口
-
-本机 N100 是 **Silicon Labs CP210x**（`lsusb` `10c4:ea60`），枚举为 `/dev/ttyUSB*`，**不是** `ttyACM*`。
-
-MBS 编码器 USB-RS485 是 **Prolific pl2303**，也会变成 `ttyUSB*`。两个口插拔顺序会换号；曾经把编码器工具开到 IMU 的 cp210x 上，解析出 `FC...FD` 垃圾帧。**一律用 by-id。**
-
 - **N100（本机）**  
   `/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0003-if00-port0`
-- **MBS USB-RS485（编码器，不要给 IMU）**  
-  `/dev/serial/by-id/usb-Prolific_Technology_Inc._USB-Serial_Controller_BGA_b114J19-if00-port0`
-- **`/dev/ttyACM0`、`/dev/ttyACM1` 预留给左右 USB2CAN**，不要把 IMU 接到这两路。
 
 `src/imu_node.cpp` 的 `serial_port` 默认值和 launch 参数 `port` 都已指向上面的 N100 by-id。可用 CLI / launch 覆盖，不必改源码。
 
@@ -48,13 +39,6 @@ ros2 launch wheeltec_n100_imu imu.launch.py \
 # 或 ros2 run
 ros2 run wheeltec_n100_imu imu_node --ros-args \
   -p serial_port:=/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0003-if00-port0
-```
-
-编码器（另一条口）：
-
-```bash
-ros2 run biped_hw mbs_encoder_recv --iface d --addr 0x1F --baud 2500000
-# 默认读 share/biped_hw/config/mbs_encoder.yaml 的 Prolific by-id
 ```
 
 话题（上游）：`/imu`、`/imu_trueEast`、`/magnetic_field`、`/magnetic_pose_2d`。

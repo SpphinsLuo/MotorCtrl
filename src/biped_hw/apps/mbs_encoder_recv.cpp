@@ -138,9 +138,11 @@ void usage()
       "                        [--self-test] [--set-zero]\n"
       " sku=%s  --addr single-polls (default 0x1F). --map polls 8 yaml addrs\n"
       " (4,5,6,7,10,11,12,13) sequential BUS-D. Do not combine --map and --addr.\n"
-      " --set-zero WRITES encoder firmware/device zero at current shaft (BUS-D\n"
-      " SetZero); not a yaml zero_rad edit. One-shot then one GetInfo. Needs\n"
-      " --addr N or --map. Not with --duration / --iface r / --self-test.\n",
+      " --set-zero WRITES encoder firmware/device zero at current shaft.\n"
+      " Datasheet handshake: alternate GetInfo(00)/SetZero(01) 10 times, wait\n"
+      " each reply; C==10 commits (then 50 ms silent). A single 01 does not write.\n"
+      " Not yaml zero_rad. Needs --addr N or --map. Not with --duration /\n"
+      " --iface r / --self-test.\n",
       biped_hw::kMbsSkuUser);
 }
 
@@ -850,34 +852,39 @@ int run(Options opt)
   {
     std::fprintf(stderr,
                  "WARN: --set-zero WRITES encoder device zero at current shaft "
-                 "(BUS-D SetZero). Not yaml zero_rad.\n");
-    bool any_info = false;
+                 "(BUS-D 00/01 x10). Not yaml zero_rad.\n");
+    bool any_ok = false;
+    bool all_ok = true;
     for (const auto &tgt : targets)
     {
       const uint8_t tx =
           biped_hw::mbs_bus_request(biped_hw::MbsBusOp::SetZero, tgt.addr);
-      if (!biped_hw::mbs_bus_send_set_zero(serial, tgt.addr, opt.rts_de))
-      {
-        std::fprintf(stderr, "set-zero addr=%u tx=0x%02X failed\n",
-                     static_cast<unsigned>(tgt.addr), static_cast<unsigned>(tx));
-        return 1;
-      }
+      biped_hw::MbsSetZeroResult zr{};
+      const bool seq = biped_hw::mbs_bus_set_zero_sequence(serial, tgt.addr, opt.timeout_ms,
+                                                           opt.rts_de, zr);
       if (tgt.name != nullptr)
       {
-        std::printf("set-zero addr=%u name=%s tx=0x%02X sent\n",
-                    static_cast<unsigned>(tgt.addr), tgt.name,
-                    static_cast<unsigned>(tx));
+        std::printf("set-zero addr=%u name=%s tx=0x%02X pairs=%d C=%u %s\n",
+                    static_cast<unsigned>(tgt.addr), tgt.name, static_cast<unsigned>(tx),
+                    zr.pairs, static_cast<unsigned>(zr.last_c),
+                    seq ? "committed" : "FAIL");
       }
       else
       {
-        std::printf("set-zero addr=%u tx=0x%02X sent\n",
-                    static_cast<unsigned>(tgt.addr), static_cast<unsigned>(tx));
+        std::printf("set-zero addr=%u tx=0x%02X pairs=%d C=%u %s\n",
+                    static_cast<unsigned>(tgt.addr), static_cast<unsigned>(tx), zr.pairs,
+                    static_cast<unsigned>(zr.last_c), seq ? "committed" : "FAIL");
+      }
+      if (!seq)
+      {
+        all_ok = false;
+        continue;
       }
       biped_hw::MbsSample sample{};
       if (biped_hw::mbs_bus_poll_once(serial, tgt.addr, opt.timeout_ms, opt.rts_de,
                                       sample))
       {
-        any_info = true;
+        any_ok = true;
         if (tgt.name != nullptr)
         {
           std::printf("addr=%u name=%s valid=1 ", static_cast<unsigned>(tgt.addr),
@@ -887,16 +894,18 @@ int run(Options opt)
       }
       else if (tgt.name != nullptr)
       {
-        std::printf("addr=%u name=%s valid=0 (GetInfo after SetZero)\n",
+        std::printf("addr=%u name=%s valid=0 (GetInfo after commit)\n",
                     static_cast<unsigned>(tgt.addr), tgt.name);
+        all_ok = false;
       }
       else
       {
-        std::printf("addr=%u valid=0 (GetInfo after SetZero)\n",
+        std::printf("addr=%u valid=0 (GetInfo after commit)\n",
                     static_cast<unsigned>(tgt.addr));
+        all_ok = false;
       }
     }
-    return any_info ? 0 : 1;
+    return all_ok && any_ok ? 0 : 1;
   }
 
   std::signal(SIGINT, on_sigint);

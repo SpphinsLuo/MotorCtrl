@@ -13,7 +13,7 @@
 namespace biped_hw
 {
 
-inline constexpr float kQuinticAmpRad = 0.35f;  // ~20 deg
+inline constexpr float kQuinticAmpRad = 0.18f;  // ~10 deg
 inline constexpr double kQuinticSegTime_s = 1.0;  // motor_ctrl t_end=1
 
 // One point-to-point segment. t clamped to [0, T]. Null q/dq skipped.

@@ -68,7 +68,7 @@ struct AlgoSources
   FrameDemux *right_demux = nullptr;
   LimitParam lims[16]{};
   SerialPort *mbs = nullptr;
-  int mbs_timeout_ms = 8;
+  int mbs_timeout_ms = 2;
   bool mbs_rts_de = true;
   bool poll_mbs = false;
   const ImuFeedback *imu_latch = nullptr;

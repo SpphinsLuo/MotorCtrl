@@ -1,9 +1,9 @@
 // biped_hw — p3_runtime.hpp
-// P3 apps 共用：CLI、探测、仅对选中 ID 写 CTRL_MODE/使能、同周期 hold 或 triangle。
-// --ids 列出 HA60 则纳入伺服（不因默认 skip-motorevo 丢掉）。缺电机超时记 drop。
+// P3 apps 共用：CLI、探测、仅对选中 ID 写 CTRL_MODE/使能、同周期 hold 或 sine。
+// 只操作 --ids（dual12 默认 map 3–14；right6 默认右腿 9–14；其余默认 6）。缺电机超时记 drop。
 // --comms-only：只 RID / MIT kp=0 inquire / HA60 evo status，不发 0xFC。
-// --stage triangle：绕探测 q0 三角摆，不调用 dm_home_to_zero / 不回固件 0。
-// --set-zero：对选中 --ids 写固件零点（Damiao MIT 0xFE / HA60 V1 0xFE），不发 0xFC，
+// --stage sine：绕探测 q0 正弦摆，不调用 dm_home_to_zero / 不回固件 0。
+// --set-zero：对选中 --ids 写固件零点（Damiao / HA60 官方 0xFE），
 // 不与 --stage 并用；随后 0xFD。
 #pragma once
 
@@ -25,7 +25,7 @@ enum class P3App : uint8_t
 enum class P3Stage : uint8_t
 {
   Hold = 0,
-  Triangle,
+  Sine,
 };
 
 struct P3Options
@@ -39,13 +39,13 @@ struct P3Options
   int drain_ms = 8;
   float kp = 8.f;
   float kd = 0.5f;
+  float tau_ff = 0.f;
   float vel = 0.2f;
   float stroke = 0.349f;  // ±20 deg
-  float abort_tau = 15.f;
+  float abort_tau = 0.f;  // 0 = per-motor TMAX (peak)
   std::vector<uint8_t> ids = {6};
   std::vector<uint8_t> ignore_ids;
   P3Stage stage = P3Stage::Hold;
-  bool skip_motorevo = true;
   bool require_all = false;
   bool allow_single_bus = false;
   bool enable_all_anyway = false;

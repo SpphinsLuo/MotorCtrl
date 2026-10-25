@@ -131,13 +131,17 @@ inline void pack_set_zero(uint8_t out[8])
   out[7] = kDmSetZeroCmd;
 }
 
+// Damiao MIT wire range. CLI caps in P2/P3/P6 use these, not a tighter hold limit.
+inline constexpr float kMitKpMax = 500.f;
+inline constexpr float kMitKdMax = 5.f;
+
 // MIT command (sent to motor CAN ID / ESC_ID):
-//   q 16, dq 12, kp 12, kd 12, tau 12. kp 0-500, kd 0-5.
+//   q 16, dq 12, kp 12, kd 12, tau 12. kp 0-500, kd 0-5. tau is ±TMAX.
 inline void pack_mit(uint8_t out[8], float kp, float kd, float q, float dq, float tau,
                      const LimitParam &lim)
 {
-  const uint16_t kp_uint = float_to_uint(kp, 0.f, 500.f, 12);
-  const uint16_t kd_uint = float_to_uint(kd, 0.f, 5.f, 12);
+  const uint16_t kp_uint = float_to_uint(kp, 0.f, kMitKpMax, 12);
+  const uint16_t kd_uint = float_to_uint(kd, 0.f, kMitKdMax, 12);
   const uint16_t q_uint = float_to_uint(q, -lim.q_max, lim.q_max, 16);
   const uint16_t dq_uint = float_to_uint(dq, -lim.dq_max, lim.dq_max, 12);
   const uint16_t tau_uint = float_to_uint(tau, -lim.tau_max, lim.tau_max, 12);
@@ -401,8 +405,8 @@ inline void unpack_mit_cmd(const uint8_t in[8], const LimitParam &lim, float &kp
       static_cast<uint16_t>((static_cast<uint16_t>(in[5]) << 4) | (in[6] >> 4));
   const uint16_t tau_uint =
       static_cast<uint16_t>((static_cast<uint16_t>(in[6] & 0x0F) << 8) | in[7]);
-  kp = uint_to_float(kp_uint, 0.f, 500.f, 12);
-  kd = uint_to_float(kd_uint, 0.f, 5.f, 12);
+  kp = uint_to_float(kp_uint, 0.f, kMitKpMax, 12);
+  kd = uint_to_float(kd_uint, 0.f, kMitKdMax, 12);
   q = uint_to_float(q_uint, -lim.q_max, lim.q_max, 16);
   dq = uint_to_float(dq_uint, -lim.dq_max, lim.dq_max, 12);
   tau = uint_to_float(tau_uint, -lim.tau_max, lim.tau_max, 12);

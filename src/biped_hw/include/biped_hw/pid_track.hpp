@@ -3,7 +3,7 @@
 // 曲线形状在 quintic_traj.hpp，这里只跟踪调用方给的 q_des。
 //
 // 内环（不要再套一层主机 PID）：
-//   Damiao MIT：包内 PD — pack_mit(q_des, dq_des, kp, kd, tau_ff=0)。
+//   Damiao MIT：包内 PD — pack_mit(q_des, dq_des, kp, kd, tau_ff)。
 //   HA60 servo：固件位置/速度环 — pack_motorevo_servo(θ_ref=q_des, pos kp/kd, V_ref)。
 // 髋并联用 hip_ik 的调用在 sendCommand，不在这里。
 #pragma once

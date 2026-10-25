@@ -123,6 +123,85 @@ bool dm_send_set_zero(UsbCanAdapter &ad, uint8_t id)
   return ok;
 }
 
+void evo_send_disable(UsbCanAdapter &ad, uint8_t id)
+{
+  if (!ad.is_open())
+  {
+    return;
+  }
+  uint8_t buf[8] = {};
+  pack_motorevo_disable(buf);
+  ad.sendCan(id, buf, 8);
+  usleep(kDmDisableGapUs);
+  ad.sendCan(id, buf, 8);
+}
+
+bool evo_send_enable(UsbCanAdapter &ad, uint8_t id)
+{
+  if (!ad.is_open())
+  {
+    return false;
+  }
+  uint8_t buf[8] = {};
+  pack_motorevo_enable(buf);
+  return ad.sendCan(id, buf, 8);
+}
+
+bool evo_send_set_zero(UsbCanAdapter &ad, uint8_t id)
+{
+  return evo_send_set_zero(ad, id, nullptr, nullptr, nullptr);
+}
+
+bool evo_send_set_zero(UsbCanAdapter &ad, uint8_t id, FrameDemux *dm, float *q_before,
+                       float *q_after)
+{
+  if (!ad.is_open())
+  {
+    return false;
+  }
+  // SetzeroPosition on MotorID, then SaveFlash on 0x600+ID (§6.9.9).
+  // No servo between enable and 0xFE. Old 67 06… on MotorID is not SaveFlash.
+  evo_send_disable(ad, id);
+  if (dm != nullptr && q_before != nullptr)
+  {
+    (void)evo_probe_q0(ad, *dm, id, *q_before);
+    evo_send_disable(ad, id);
+  }
+  if (!evo_send_enable(ad, id))
+  {
+    return false;
+  }
+  usleep(kDmDisableGapUs);
+  uint8_t z[8] = {};
+  pack_motorevo_set_zero(z);
+  bool ok = ad.sendCan(id, z, 8);
+  usleep(kDmDisableGapUs);
+  uint8_t save[8] = {};
+  pack_motorevo_save_flash(save);
+  ok = ad.sendCan(motorevo_param_can_id(id), save, 8) && ok;
+  usleep(300000);
+  ad.drain();
+  if (dm != nullptr && q_after != nullptr)
+  {
+    (void)evo_probe_q0(ad, *dm, id, *q_after);
+  }
+  return ok;
+}
+
+bool evo_enable_servo(UsbCanAdapter &ad, uint8_t id)
+{
+  evo_send_disable(ad, id);
+  usleep(kDmDisableGapUs);
+  ad.drain();
+  if (!evo_send_enable(ad, id))
+  {
+    return false;
+  }
+  usleep(kDmEnableSettleUs);
+  ad.drain();
+  return true;
+}
+
 bool dm_wait_register(UsbCanAdapter &ad, FrameDemux &dm, uint8_t esc_id, uint8_t rid,
                       DmRegisterReply &reply, int timeout_ms, const DmXactHook *hook)
 {
@@ -199,36 +278,6 @@ bool dm_write_rid_u32(UsbCanAdapter &ad, FrameDemux &dm, uint8_t esc_id, uint8_t
   return false;
 }
 
-bool dm_read_pvt_limits(UsbCanAdapter &ad, FrameDemux &dm, uint8_t esc_id, LimitParam &lim,
-                        DmMitEnableStatus *st, const DmXactHook *hook)
-{
-  float pmax = 0.f, vmax = 0.f, tmax = 0.f;
-  const bool pok = dm_read_rid(ad, dm, esc_id, static_cast<uint8_t>(DmRid::Pmax), pmax, hook);
-  const bool vok = dm_read_rid(ad, dm, esc_id, static_cast<uint8_t>(DmRid::Vmax), vmax, hook);
-  const bool tok = dm_read_rid(ad, dm, esc_id, static_cast<uint8_t>(DmRid::Tmax), tmax, hook);
-  const bool ok = pok && vok && tok && pmax > 0.1f && vmax > 0.1f && tmax > 0.1f;
-  if (st != nullptr)
-  {
-    st->pmax = pmax;
-    st->vmax = vmax;
-    st->tmax = tmax;
-    st->pmax_ok = pok;
-    st->vmax_ok = vok;
-    st->tmax_ok = tok;
-    st->rid_ok = ok;
-  }
-  if (!ok)
-  {
-    return false;
-  }
-  lim = LimitParam{pmax, vmax, tmax};
-  if (st != nullptr)
-  {
-    st->lim = lim;
-  }
-  return true;
-}
-
 bool dm_set_ctrl_mode(UsbCanAdapter &ad, FrameDemux &dm, uint8_t esc_id, uint32_t mode,
                       DmMitEnableStatus &st, const DmXactHook *hook)
 {
@@ -257,16 +306,9 @@ bool dm_set_ctrl_mode_mit(UsbCanAdapter &ad, FrameDemux &dm, uint8_t esc_id,
 }
 
 DmMitEnableErr dm_enable_mode(UsbCanAdapter &ad, FrameDemux &dm, uint8_t id, uint32_t mode,
-                              bool require_pvt, DmMitEnableStatus &st, const DmXactHook *hook)
+                              DmMitEnableStatus &st, const DmXactHook *hook)
 {
   st = {};
-  if (require_pvt)
-  {
-    if (!dm_read_pvt_limits(ad, dm, id, st.lim, &st, hook))
-    {
-      return DmMitEnableErr::Rid;
-    }
-  }
   dm_send_disable(ad, id);
   usleep(kDmDisableGapUs);
   ad.drain();
@@ -283,10 +325,10 @@ DmMitEnableErr dm_enable_mode(UsbCanAdapter &ad, FrameDemux &dm, uint8_t id, uin
   return DmMitEnableErr::Ok;
 }
 
-DmMitEnableErr dm_enable_mit(UsbCanAdapter &ad, FrameDemux &dm, uint8_t id, bool require_pvt,
+DmMitEnableErr dm_enable_mit(UsbCanAdapter &ad, FrameDemux &dm, uint8_t id,
                              DmMitEnableStatus &st, const DmXactHook *hook)
 {
-  return dm_enable_mode(ad, dm, id, kDmMitMode, require_pvt, st, hook);
+  return dm_enable_mode(ad, dm, id, kDmMitMode, st, hook);
 }
 
 bool dm_probe_q0(UsbCanAdapter &ad, FrameDemux &dm, uint8_t id, const LimitParam &lim, float &q0,
@@ -406,7 +448,7 @@ DmHomeResult dm_home_to_zero(UsbCanAdapter &ad, FrameDemux &dm, uint8_t id,
   while (std::chrono::steady_clock::now() < deadline)
   {
     uint8_t cmd[8] = {};
-    dm_pack_host_dq(cmd, kd, -std::copysign(vel, q), 0.f, lim);
+    dm_pack_host_dq(cmd, kd, -std::copysign(vel, q), -std::copysign(kDmHomeTauFf, q), lim);
     (void)ad.sendCan(id, cmd, 8);
     const auto tick_end = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(kDmHomePeriodMs);

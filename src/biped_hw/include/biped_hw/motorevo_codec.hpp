@@ -3,8 +3,10 @@
 //   《Motorevo驱动用户指南 V3.5》§6.3.1 伺服帧 + Motorevo_SDK Motorevo_Test/Bsp/bsp_Motorevo.c
 // 伺服默认给 P1 hold / P2 track；力位混合打包保留但不在这两个 app 里切换。
 // 线上单位是 rad / rad/s（默认 ±12.5 rad、±10 rad/s），不是度。all_motor.h 的 deg_to_rad
-// 只是旧调用侧包装，不是 CAN 映射。使能/失能 0xFC / 0xFD；设零 V1 0xFE（HA60 默认），
-// V2 为 67 06 FF 00 00 00 00 76。发送路径不调用 receive()。
+// 只是旧调用侧包装，不是 CAN 映射。使能/失能 0xFC / 0xFD。
+// 设零：§ SetzeroPosition = 标准帧、ID=MotorID、FF×7+FE（Torque4 才 +100）。
+// 掉电保持：§6.9.9 SaveFlash，标准帧 ID=0x600+MotorID，
+// 67 00 00 00 00 00 15 76（2024.9.25 后固件）。发送路径不调用 receive()。
 #pragma once
 
 #include "biped_hw/dm_codec.hpp"
@@ -60,7 +62,8 @@ inline void pack_motorevo_disable(uint8_t out[8]) { pack_disable(out); }
 // V1: all_motor.h Motorevo_set_zero_position → {0xFF×7, 0xFE}. Same MIT opcode as Damiao.
 inline void pack_motorevo_set_zero_v1(uint8_t out[8]) { pack_set_zero(out); }
 
-// V2: all_motor.h Motorevo_set_zero_position_V2 → {0x67,0x06,0xFF,0x00,0x00,0x00,0x00,0x76}.
+// Historical all_motor.h Motorevo_set_zero_position_V2. Wrong CAN ID and
+// bytes vs §6.9.9 (must go to 0x600+ID, Byte1=index, Byte6=0x15 write).
 inline void pack_motorevo_set_zero_v2(uint8_t out[8])
 {
   out[0] = 0x67;
@@ -73,8 +76,41 @@ inline void pack_motorevo_set_zero_v2(uint8_t out[8])
   out[7] = 0x76;
 }
 
-// HA60 in this repo is V1 (0xFC/0xFD servo path; Motorevo_set_zero_position, not V2).
+// Official SetzeroPosition on MotorID. Persist is a separate SaveFlash.
 inline void pack_motorevo_set_zero(uint8_t out[8]) { pack_motorevo_set_zero_v1(out); }
+
+// §6.9.9 2024.9.25+ : param TX on 0x600+MotorID. MachineAngleOffset index 0x23.
+inline constexpr uint32_t kMotorevoParamCanOff = 0x600u;
+inline constexpr uint8_t kMotorevoParamHdr = 0x67;
+inline constexpr uint8_t kMotorevoParamTail = 0x76;
+inline constexpr uint8_t kMotorevoParamRead = 0x04;
+inline constexpr uint8_t kMotorevoParamWrite = 0x15;
+inline constexpr uint8_t kMotorevoIdxSaveFlash = 0x00;
+inline constexpr uint8_t kMotorevoIdxMachineAngleOffset = 0x23;
+
+inline uint32_t motorevo_param_can_id(uint8_t motor_id)
+{
+  return kMotorevoParamCanOff + static_cast<uint32_t>(motor_id);
+}
+
+inline void pack_motorevo_param_write(uint8_t out[8], uint8_t index, const uint8_t data[4])
+{
+  out[0] = kMotorevoParamHdr;
+  out[1] = index;
+  out[2] = data != nullptr ? data[0] : 0;
+  out[3] = data != nullptr ? data[1] : 0;
+  out[4] = data != nullptr ? data[2] : 0;
+  out[5] = data != nullptr ? data[3] : 0;
+  out[6] = kMotorevoParamWrite;
+  out[7] = kMotorevoParamTail;
+}
+
+// SaveFlash: index 0x00, data unused, write 0x15. Byte2–5 = 0.
+inline void pack_motorevo_save_flash(uint8_t out[8])
+{
+  const uint8_t z[4] = {};
+  pack_motorevo_param_write(out, kMotorevoIdxSaveFlash, z);
+}
 
 // 伺服帧（官方 §6.3.1 / Motorevo_motor_servo_control_mode）：
 //   Byte0-1 θ_ref 16bit  rad  默认 ±12.5（不是 5.0，q≈5 不是饱和）
@@ -324,28 +360,27 @@ inline bool motorevo_codec_self_check()
     return false;
   }
   uint8_t z1[8] = {};
-  pack_motorevo_set_zero(z1);
-  uint8_t z1b[8] = {};
-  pack_motorevo_set_zero_v1(z1b);
-  // V1 / HA60 default: {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFE}
+  pack_motorevo_set_zero_v1(z1);
   if (z1[0] != 0xFF || z1[1] != 0xFF || z1[2] != 0xFF || z1[3] != 0xFF ||
       z1[4] != 0xFF || z1[5] != 0xFF || z1[6] != 0xFF || z1[7] != kMotorevoSetZeroCmd)
   {
     return false;
   }
-  for (int i = 0; i < 8; ++i)
-  {
-    if (z1[i] != z1b[i])
-    {
-      return false;
-    }
-  }
   uint8_t z2[8] = {};
   pack_motorevo_set_zero_v2(z2);
+  uint8_t zdef[8] = {};
+  pack_motorevo_set_zero(zdef);
   const uint8_t z2_expect[8] = {0x67, 0x06, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x76};
+  uint8_t save[8] = {};
+  pack_motorevo_save_flash(save);
+  const uint8_t save_expect[8] = {0x67, 0x00, 0x00, 0x00, 0x00, 0x00, 0x15, 0x76};
+  if (motorevo_param_can_id(8) != 0x608u || motorevo_param_can_id(14) != 0x60Eu)
+  {
+    return false;
+  }
   for (int i = 0; i < 8; ++i)
   {
-    if (z2[i] != z2_expect[i])
+    if (z2[i] != z2_expect[i] || zdef[i] != z1[i] || save[i] != save_expect[i])
     {
       return false;
     }

@@ -489,8 +489,21 @@ inline int mbs_codec_self_test()
 enum class MbsBusOp : uint8_t
 {
   GetInfo = 0,   // b6:5 = 00
-  SetZero = 1,   // b6:5 = 01
-  SetAddr = 2,   // b6:5 = 10
+  SetZero = 1,   // b6:5 = 01  reply n=2: S, C
+  SetAddr = 2,   // b6:5 = 10  reply n=2: S, C
+};
+
+// Datasheet: SetZero is not a single 01. Alternate 00/01 ten times (wait for
+// each reply). C is the pair count; C==10 commits (≤50 ms, encoder silent).
+// A lone 01 after anything other than 00 returns C=0 and does not write.
+inline constexpr int kMbsBusSetZeroPairs = 10;
+inline constexpr int kMbsBusSetZeroExecMs = 50;
+inline constexpr std::size_t kMbsBusSetAckSize = 4;  // B0 + S + C + CRC
+
+struct MbsSetAck
+{
+  uint8_t status = 0;
+  uint8_t count = 0;
 };
 
 enum class MbsIface : uint8_t
@@ -683,6 +696,26 @@ inline bool mbs_bus_unpack(const uint8_t *frame, std::size_t length, const MbsBu
 
   (void)off;
   out = s;
+  return true;
+}
+
+inline bool mbs_bus_unpack_set_ack(const uint8_t *frame, std::size_t length, uint8_t addr,
+                                   MbsSetAck &out)
+{
+  if (frame == nullptr || length < kMbsBusSetAckSize)
+  {
+    return false;
+  }
+  if (!mbs_bus_crc8_ok(frame, kMbsBusSetAckSize))
+  {
+    return false;
+  }
+  if (frame[0] != mbs_bus_request(MbsBusOp::SetZero, addr))
+  {
+    return false;
+  }
+  out.status = frame[1];
+  out.count = frame[2];
   return true;
 }
 
@@ -899,6 +932,16 @@ inline int mbs_bus_codec_self_test()
   if (mbs_bus_request(MbsBusOp::SetZero, 12) != 0x2C)
   {
     return 40;
+  }
+
+  {
+    uint8_t f[4] = {0x26, 0x00, 10, 0};
+    mbs_bus_append_crc(f, 3);
+    MbsSetAck ack{};
+    if (!mbs_bus_unpack_set_ack(f, 4, 6, ack) || ack.count != 10)
+    {
+      return 41;
+    }
   }
   return 0;
 }
