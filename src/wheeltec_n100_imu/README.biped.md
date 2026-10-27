@@ -17,7 +17,7 @@ Humble apt **没有** `ros-humble-serial`（`ros-humble-serial-driver` 是另一
 ## 编译
 
 ```bash
-cd /home/ye/00_jfl_26.10/MotorCtrl
+cd /home/ye/00_jfl_26.10/Biped_Hw
 source /opt/ros/humble/setup.bash
 colcon build --packages-select serial wheeltec_n100_imu
 # 或：colcon build --packages-up-to wheeltec_n100_imu

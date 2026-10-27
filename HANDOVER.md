@@ -4,9 +4,9 @@
 
 **目标：** 线驱 12 电机双足底座 → MPC + Residual RL（P7 未开工）。
 
-**本机硬件：** 双 USB2CAN · 达妙 MIT（多数）+ Motorevo HA60（踝 roll）· MBS 关节编码器 · Wheeltec N100 IMU。算法与驱动同机 onboard mini-PC。
+**本机硬件：** KH-UCANFDX6-Mini 单 USB 多路 CAN · 达妙 MIT（多数）+ Motorevo HA60（踝 roll）· MBS 关节编码器 · Wheeltec N100 IMU。算法与驱动同机 onboard mini-PC。
 
-**工作区：** `/home/ye/00_jfl_26.10/MotorCtrl`（colcon）。新代码 `src/biped_hw`。旧 `src/motor_ctrl` 只读冻结。旁路包：`src/serial`、`src/wheeltec_n100_imu`。规则：`.cursor/rules/karpathy-guidelines.mdc`、`.cursor/rules/motorctrl.mdc`。
+**工作区：** `/home/ye/00_jfl_26.10/Biped_Hw`（colcon）。电机控制包源码位于 `src/motor_ctrl`，ROS 包名为 `motor_ctrl`；MBS 独立包源码位于 `src/mbs_encoder`。旧 `src/motor_ctrl_origin` 只读冻结。旁路包：`src/serial`、`src/wheeltec_n100_imu`。规则：`.cursor/rules/karpathy-guidelines.mdc`、`.cursor/rules/motorctrl.mdc`。
 
 ---
 
@@ -14,12 +14,12 @@
 
 ```bash
 source /opt/ros/humble/setup.bash
-source /home/ye/00_jfl_26.10/MotorCtrl/install/setup.bash
+source /home/ye/00_jfl_26.10/Biped_Hw/install/setup.bash
 ```
 
 - **Never** `~/WS/install` 或其它 workspace overlay。
 - 拷到机载后改第二行路径，例如 `source /home/<user>/motorctrl/install/setup.bash`。
-- 确认：`echo $AMENT_PREFIX_PATH` 里应出现 `.../motorctrl/install/biped_hw` 且在 `/opt/ros/humble` 之前。
+- 确认：`echo $AMENT_PREFIX_PATH` 里应出现 `.../motorctrl/install/motor_ctrl` 且在 `/opt/ros/humble` 之前。
 
 ---
 
@@ -33,7 +33,7 @@ source /home/ye/00_jfl_26.10/MotorCtrl/install/setup.bash
 | `--help` 是 CLI 真相        | 不要发明 flag；改代码后先 `--help` 再跑                                              |
 | `--can-id` 十进制           | `12` 不是 `0x0C`。达妙上位机 UI 是十六进制（12 → `0x0C`）                               |
 | 串口 by-id                 | N100 / MBS **禁止** `ttyUSB0/1`（CP210x 与 pl2303 会换号）                       |
-| USB2CAN                  | 目前仍 `ttyACM0/ACM1`；udev 别名草稿未填 serial。**不要默认 ACM0=左腿**                   |
+| CAN 设备                 | KH-UCANFDX6-Mini 当前由 `peak_usb` 提供 `can0`–`can5`；已确认左腿 `can0`、右腿 `can1`。旧 USB2CAN 串口模式仍可显式使用 |
 | MIT 量程用表               | `types.hpp` `default_limit`。不读 RID 21/22/23，没有 `--force-limits`             |
 | `--abort-tau` 默认 TMAX    | 按电机峰值：DM10010/L **200**、DM10422 **400**、HA60 **50**。`--abort-tau N` 仍可覆盖 |
 | apps 独立                  | 禁止 `#include` 另一个 app。共享逻辑在 `include/biped_hw` + `src/`                  |
@@ -53,18 +53,18 @@ Master **每总线都是 2**。左 ACM0 CAN **3–8**；右 ACM1 CAN **9–14**�
 
 | 腿   | 口（本机默认）        | Master | CAN    | 关节                 | 型号       |
 | --- | -------------- | ------ | ------ | ------------------ | -------- |
-| L   | `/dev/ttyACM0` | 2      | 3      | hip yaw            | DM10010L |
-| L   | ACM0           | 2      | 4      | hip parallel OUTER | DM10010  |
-| L   | ACM0           | 2      | 5      | hip parallel INNER | DM10010  |
-| L   | ACM0           | 2      | 6      | knee pitch         | DM10422  |
-| L   | ACM0           | 2      | 7      | ankle pitch        | DM10010L |
-| L   | ACM0           | 2      | **8**  | ankle roll         | **HA60** |
-| R   | `/dev/ttyACM1` | 2      | 9      | hip yaw            | DM10010L |
-| R   | ACM1           | 2      | 10     | hip parallel OUTER | DM10010  |
-| R   | ACM1           | 2      | 11     | hip parallel INNER | DM10010  |
-| R   | ACM1           | 2      | 12     | knee pitch         | DM10422  |
-| R   | ACM1           | 2      | 13     | ankle pitch        | DM10010L |
-| R   | ACM1           | 2      | **14** | ankle roll         | **HA60** |
+| L   | `socketcan:can0` | 2      | 3      | hip yaw            | DM10010L |
+| L   | can0             | 2      | 4      | hip parallel OUTER | DM10010  |
+| L   | can0             | 2      | 5      | hip parallel INNER | DM10010  |
+| L   | can0             | 2      | 6      | knee pitch         | DM10422  |
+| L   | can0             | 2      | 7      | ankle pitch        | DM10010L |
+| L   | can0             | 2      | **8**  | ankle roll         | **HA60** |
+| R   | `socketcan:can1` | 2      | 9      | hip yaw            | DM10010L |
+| R   | can1             | 2      | 10     | hip parallel OUTER | DM10010  |
+| R   | can1             | 2      | 11     | hip parallel INNER | DM10010  |
+| R   | can1             | 2      | 12     | knee pitch         | DM10422  |
+| R   | can1             | 2      | 13     | ankle pitch        | DM10010L |
+| R   | can1             | 2      | **14** | ankle roll         | **HA60** |
 
 
 **MBS 8 路地址（十进制，关节空间）：** 4, 5, 6, 7, 10, 11, 12, 13。髋 yaw / 踝 roll **无编码器**。yaml `zero_rad=0` `sign=+1`，未标定。不要往传感器写新地址。
@@ -125,7 +125,7 @@ Damiao 回包 CAN ID 全是 Master `0x02` → demux 用 payload `D[0]` 低 4 位
 | -------------------------------------------------------------- | ------------------------------------------------------- |
 | `include/biped_hw/motor_map.hpp` + `config/motor_map.yaml`     | 权威 ID 表；yaml 只覆盖串口                                      |
 | `dm_codec.hpp` / `motorevo_codec.hpp` / `frame_demux.hpp`      | MIT / HA60 servo；Damiao 按 ESC_ID demux                  |
-| `usb_can_adapter.hpp` `serial_port.hpp` `bus_cycle.hpp`        | 双 USB2CAN 0x55/0xAA；write-all / drain-all               |
+| `usb_can_adapter.hpp` `serial_port.hpp` `bus_cycle.hpp`        | SocketCAN（KH）和旧 USB2CAN 0x55/0xAA 双后端；write-all / drain-all |
 | `dm_mit_host.hpp`                                              | 0xFC/0xFD、RID、q0 probe、限速 home、MIT pack                 |
 | `safety.hpp` `src/safety.cpp`                                  | watchdog / 10–12 rad / 15 Nm / disable-all 3–14         |
 | `robot_state.hpp` `mbs_map.hpp` `mbs_host.hpp` `mbs_codec.hpp` | 12 电机 + 8 MBS + IMU latch                               |
@@ -134,7 +134,7 @@ Damiao 回包 CAN ID 全是 Master `0x02` → demux 用 payload `D[0]` 低 4 位
 | `pid_track.hpp`                                                | **只 pack**，不生成曲线，无外环主机 PID                              |
 | `quintic_traj.hpp` `src/quintic_traj.cpp`                      | 五次摆：q0→q0+A→q0→q0−A→q0                                  |
 | `apps/*.cpp`                                                   | 相位测试；薄 main                                             |
-| `src/motor_ctrl/*`                                             | 冻结参考；不要链接进热路径                                           |
+| `src/motor_ctrl_origin/*`                                     | 冻结参考；不要链接进热路径                                           |
 | `src/wheeltec_n100_imu/`                                       | 独立 `imu_node`；p4/p6 只 latch `/imu`                      |
 | `udev/99-usb2can-biped.rules`                                  | 草稿，`ATTRS{serial}` 未填，**不要原样启用**                        |
 
@@ -148,41 +148,45 @@ Damiao 回包 CAN ID 全是 Master `0x02` → demux 用 payload `D[0]` 低 4 位
 先 overlay。**身份用 dump-rids（无** `--stage` **= 不使能）。**
 
 ```bash
-# P0 smoke：打 map + 开双口，不使能
-ros2 run biped_hw hw_smoke_dual_bus --require-ports \
-  --left-port /dev/ttyACM0 --right-port /dev/ttyACM1
+# KH-UCANFDX6-Mini：配置 can0/can1 为经典 CAN 1 Mbit/s
+# 本机驱动显示为 peak_usb；can2..can5 保留，不参与电机控制
+sudo src/motor_ctrl/config/configure_kh_ucanfdx6.sh
 
-# 身份：P1/P2 CAN ID 在源码 kCanId，改完重新编译。口仍用 --port（ACM 可能对调）
-ros2 run biped_hw p2_dm_test --dump-rids --port /dev/ttyACM0
-ros2 run biped_hw p2_dm_test --dump-rids --port /dev/ttyACM1
+# P0 smoke：打开同一 KH 设备的两个 SocketCAN 通道，不使能
+ros2 run motor_ctrl hw_smoke_dual_bus --require-ports \
+  --left-port socketcan:can0 --right-port socketcan:can1
+
+# 身份：P1/P2 CAN ID 在源码 kCanId，改完重新编译
+ros2 run motor_ctrl p2_dm_test --dump-rids --port socketcan:can0
+ros2 run motor_ctrl p2_dm_test --dump-rids --port socketcan:can1
 
 # 右6 只通信（无 0xFC）。列出 9–14 才会问 HA60
-ros2 run biped_hw p3_right6_sync --comms-only --port /dev/ttyACM1 \
+ros2 run motor_ctrl p3_right6_sync --comms-only --port socketcan:can1 \
   --ids 9,10,11,12,13,14 --duration 3 --period-ms 10 --verbose
 
 # 右6 ±20° 正弦（使能；绕 q0；勿在未确认 comms 时跑）
-ros2 run biped_hw p3_right6_sync --port /dev/ttyACM1 \
+ros2 run motor_ctrl p3_right6_sync --port socketcan:can1 \
   --ids 9,10,11,12,13,14 --stage sine \
   --stroke 0.349 --vel 0.20 --duration 18 --kp 20 --kd 0.5 --abort-tau 15
 
 # P6 离线（无硬件、无 0xFC）
-ros2 run biped_hw p6_traj_track --self-test
+ros2 run motor_ctrl p6_traj_track --self-test
 
 # P6 live 例（尚未在本通跑过；机载建议先 --amp 0.10）
-ros2 run biped_hw p6_traj_track --leg right --amp 0.10 --duration 8 \
+ros2 run motor_ctrl p6_traj_track --leg right --amp 0.10 --duration 8 \
   --abort-tau 15 --verbose
 
-# MBS 8 地址顺序轮询（不使能电机）
-ros2 run biped_hw mbs_encoder_recv --map --duration 2 --verbose
+# MBS 独立节点发布 8 路聚合状态（不使能电机）
+ros2 run mbs_encoder mbs_encoder_node
 
 # N100：launch 默认 CP2102 by-id，不是 ttyUSB
 ros2 launch wheeltec_n100_imu imu.launch.py
 # p4 锁存 /imu（p4 自己不开 N100 串口）
-ros2 run biped_hw p4_state_dump --mbs --imu-topic /imu --duration 4 --period-ms 100 --verbose
+ros2 run motor_ctrl p4_state_dump --mbs --imu-topic /imu --duration 4 --period-ms 100 --verbose
 
 # P5 / 髋 IK 离线
-ros2 run biped_hw p5_safety_self_test --self-test
-ros2 run biped_hw p4_hip_kin_self_test --self-test
+ros2 run motor_ctrl p5_safety_self_test --self-test
+ros2 run motor_ctrl p4_hip_kin_self_test --self-test
 ```
 
 `p3_right6_sync` 默认 `--ids 12`、口 ACM1，不是整条右腿。`p3_dual12_sync` 默认 `--ids 6`，缺 ACM1 要 `--allow-single-bus` 才只跑左。
@@ -198,15 +202,20 @@ ros2 run biped_hw p4_hip_kin_self_test --self-test
 | ------ | ----------------------------- | --------------------------------------------------------------------- |
 | Damiao | MIT **0xFE**                  | 当前轴角 → 电机固件原点。不发 0xFC，然后 0xFD                                         |
 | HA60   | Motorevo **V1 0xFE**          | 同上；须列入 `--ids`                                                        |
-| MBS    | `mbs_encoder_recv --set-zero` | BUS-D SetZero；要 `--addr N` 或 `--map`；不能跟 `--duration` / `--self-test` |
+| MBS    | `mbs_encoder/mbs_set_zero [--addr N,N,...]` | 无 `--addr` 写入配置的 8 个地址；指定逗号分隔地址可选择部分；执行前停止 `mbs_encoder_node` |
 
 
 ```bash
 # 这些默认不是全 ID！
-ros2 run biped_hw p3_right6_sync --set-zero          # 只写 ID12
-ros2 run biped_hw p3_dual12_sync --set-zero          # 只写 ID6
+ros2 run motor_ctrl p3_right6_sync --set-zero          # 只写 ID12
+ros2 run motor_ctrl p3_dual12_sync --set-zero          # 只写 ID6
 # 六台 / 十二台必须显式列出，HA60 还要在 --ids 里
-# ros2 run biped_hw p3_right6_sync --set-zero --ids 9,10,11,12,13,14
+# ros2 run motor_ctrl p3_right6_sync --set-zero --ids 9,10,11,12,13,14
+
+# MBS：先停止 mbs_encoder_node；无 --addr 写入配置的 8 个地址
+ros2 run mbs_encoder mbs_set_zero
+# 只写指定地址
+ros2 run mbs_encoder mbs_set_zero --addr 6,12
 ```
 
 与 `--stage` 互斥。右腿已装配、ID14 曾 ~5 rad：**不要在当前姿态上设零。** Home（限速回 0）≠ 0xFE。
@@ -240,7 +249,7 @@ ros2 run biped_hw p3_dual12_sync --set-zero          # 只写 ID6
 - [x] 拷整个 `motorctrl/` **或** `colcon build --packages-select serial wheeltec_n100_imu biped_hw`（N100 依赖工作区里的 `serial`，不是 apt `ros-humble-serial-driver`）
 - [x] `source /opt/ros/humble/setup.bash` 再 `source <机载>/motorctrl/install/setup.bash` — **不是** `~/WS/install`
 - [ ] `/dev/serial/by-id/` **在新 PC 上会变。** 重新 `ls /dev/serial/by-id/`，改：
-  - `config/mbs_encoder.yaml`（Prolific pl2303）
+  - `src/mbs_encoder/config/mbs_encoder.yaml`（Prolific pl2303）
   - `imu.launch.py` / `serial_port`（Silicon Labs CP2102）
 - [ ] USB2CAN：新机 ACM 编号会变。用 dump-rids 认左/右；需要时填 `udev/99-usb2can-biped.rules` 的真实 `idVendor/idProduct/serial`，再改 `motor_map.yaml`
 - [ ] **不要假设** `ttyACM0` **是左腿**

@@ -1,0 +1,10 @@
+std_msgs/Header header
+uint32 sequence
+uint8[] addr
+string[] name
+float64[] angle_rad
+float64[] total_rad
+uint32[] raw
+bool[] valid
+uint8[] status_raw
+uint32[] timeout_count

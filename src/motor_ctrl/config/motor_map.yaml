@@ -1,0 +1,28 @@
+# biped_hw — motor_map.yaml
+# 运行时覆盖：左右 USB-CAN 串口路径（以及日后 zero/dir）。CAN ID 仍以 motor_map.hpp 为准。
+# Runtime overlays only. CAN IDs, master ID (2 / 0x02), models, and joint
+# roles are the compile-time table in include/biped_hw/motor_map.hpp.
+#
+# KH-UCANFDX6-Mini mode: one USB device exposes multiple SocketCAN interfaces.
+# The two motor CAN wires use can0 and can1 from the same device.
+# Prefix socketcan: selects the KH SocketCAN backend.
+#
+# Legacy USB2CAN serial mode remains available by replacing these values with:
+#   /dev/ttyACM0 and /dev/ttyACM1
+#
+# Legacy aliases, if the old two-device setup is used:
+#   left:  /dev/usb2can_left
+#   right: /dev/usb2can_right
+#
+# MBS USB-RS485 encoder port is in mbs_encoder.yaml (by-id, not ttyUSB*).
+# N100 IMU is the CP210x; do not point the encoder at that adapter.
+
+buses:
+  left:
+    port: socketcan:can0
+  right:
+    port: socketcan:can1
+
+# Optional later (P1+). Do not put motor IDs here.
+# zeros: {}
+# dirs: {}

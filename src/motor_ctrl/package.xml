@@ -1,19 +1,27 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<!-- motor_ctrl — package.xml -->
+<!-- ROS 2 包清单：电机控制底层。MBS 采集和消息由独立 mbs_encoder 包提供。 -->
 <package format="3">
   <name>motor_ctrl</name>
-  <version>0.0.0</version>
-  <description>TODO: Package description</description>
-  <maintainer email="ding@todo.todo">ding</maintainer>
-  <license>TODO: License declaration</license>
+  <version>0.0.1</version>
+  <description>
+    Cable-driven biped motor control: compile-time 12-motor map, USB-CAN adapter,
+    Damiao MIT + Motorevo HA60 codec. P1: p1_dm_communicate / p1_evo_communicate
+    (CAN ID is kCanId in the source). P2: p2_dm_test / p2_evo_test.
+    P3 dual-bus: p3_dual_knee_spin (left CAN 6 ACM0 + right CAN 9 ACM1 Damiao MIT slow ramp).
+    P4/P6 consume MBS state from the independent mbs_encoder package and /imu.
+    Hip parallel FK/IK: hip_parallel_kin + p4_hip_kin_self_test (no hardware).
+    P6 getState/sendCommand + quintic_traj: p6_traj_track (quintic about probe q0; default right 9-14; --self-test).
+  </description>
+  <maintainer email="lanluo@todo.todo">lanluo</maintainer>
+  <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
-
   <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
-
-  <test_depend>ament_lint_auto</test_depend>
-  <test_depend>ament_lint_common</test_depend>
+  <depend>mbs_encoder</depend>
 
   <export>
     <build_type>ament_cmake</build_type>
